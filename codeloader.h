@@ -22,8 +22,11 @@
 
 #include <QObject>
 #include <QDir>
+#include <QResource>
 #include "vescinterface.h"
 #include "datatypes.h"
+
+static const QString VESC_PKG_RESOURCE_ROOT = "/vesc_pkg";
 
 class CodeLoader : public QObject
 {
@@ -62,6 +65,8 @@ public:
     Q_INVOKABLE bool downloadPackageArchive();
 
     Q_INVOKABLE void abortDownloadUpload();
+    Q_INVOKABLE bool registerPackageResource(VescPackage pkg);
+    Q_INVOKABLE void unregisterPackageResource();
 
     bool createPackageFromDescription(QString path, VescPackage *pkgRes = nullptr, bool reduceLisp = false);
     Q_INVOKABLE bool shouldShowPackage(VescPackage pkg);
@@ -75,6 +80,7 @@ private:
     VescInterface *mVesc;
     bool mAbortDownloadUpload;
     bool getImportFromLine(QString line, QString &path, QString &tag, bool &isInvalid);
+    QByteArray mRegisteredResourceData;
 
 };
 
