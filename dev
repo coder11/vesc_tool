@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Enter a dev shell with all build deps (desktop + Android).
+# Uses a local profile so deps survive nix-collect-garbage.
+exec nix develop --profile ./.nix-profile "$@"

@@ -53,3 +53,6 @@ res/firmwares/*/
 
 # Nix output
 /result
+.nix-profile*
+android-vesc_tool-deployment-settings.json
+android/AndroidManifest.xml

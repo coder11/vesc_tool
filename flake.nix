@@ -30,6 +30,8 @@
       let
         pkgs = import nixpkgs {
           inherit system;
+          # Google Android SDK packages are unfree; android-sdk-vesc also sets licenseAccepted via override.
+          config.allowUnfree = true;
         };
         treefmtEval = treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
         selfPkgs = import ./pkgs {
@@ -41,6 +43,26 @@
       {
         packages = selfPkgs // {
           default = selfPkgs.vesc-tool;
+          # Same SDK/NDK bundle as used by vesc-tool-android-release (androidenv).
+          vesc-android-sdk = selfPkgs.android-sdk-vesc;
+          # Qt 5.15.2 Android host tools (fixed-output / aqtinstall); qmake at …/5.15.2/android/bin.
+          qt-515-android = selfPkgs.qt-515-android;
+        };
+
+        apps = {
+          android-release = {
+            type = "app";
+            program = "${selfPkgs.vesc-tool-android-release}/bin/vesc-tool-android-release";
+          };
+        };
+
+        devShells.default = pkgs.mkShell {
+          inputsFrom = [ selfPkgs.vesc-tool ];
+          packages = [
+            selfPkgs.android-sdk-vesc
+            selfPkgs.qt-515-android
+            selfPkgs.vesc-tool-android-release
+          ];
         };
 
         # For `nix fmt`
