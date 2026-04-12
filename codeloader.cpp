@@ -31,6 +31,7 @@
 #include <QQmlEngine>
 #include <QQmlComponent>
 #include <QQuickItem>
+#include <QStandardPaths>
 
 CodeLoader::CodeLoader(QObject *parent) : QObject(parent)
 {
@@ -859,6 +860,12 @@ QByteArray CodeLoader::packVescPackage(VescPackage pkg)
         data.append(dataRaw);
     }
 
+    if (!pkg.resourceData.isEmpty()) {
+        data.vbAppendString("pkgRcc");
+        data.vbAppendInt32(pkg.resourceData.size());
+        data.append(pkg.resourceData);
+    }
+
     data.vbAppendString("qmlIsFullscreen");
     data.vbAppendInt32(1);
     data.vbAppendInt8(pkg.qmlIsFullscreen);
@@ -928,6 +935,12 @@ VescPackage CodeLoader::unpackVescPackage(QByteArray data)
             vb.remove(0, len);
             pkg.pkgDescQml = QString::fromUtf8(dataRaw);
             pkg.loadOk = true;
+        } else if (name == "pkgRcc") {
+            auto len = vb.vbPopFrontInt32();
+            auto dataRaw = vb.left(len);
+            vb.remove(0, len);
+            pkg.resourceData = dataRaw;
+            pkg.loadOk = true;
         } else {
             // Unknown identifier, skip
             auto len = vb.vbPopFrontInt32();
@@ -973,6 +986,10 @@ bool CodeLoader::installVescPackage(VescPackage pkg)
     if (!pkg.loadOk) {
         mVesc->emitMessageDialog(tr("Write Package"), tr("Package is not valid."), false);
         return false;
+    }
+
+    if (!pkg.resourceData.isEmpty()) {
+        registerPackageResource(pkg);
     }
 
     bool res = true;
@@ -1140,6 +1157,38 @@ void CodeLoader::abortDownloadUpload()
     mAbortDownloadUpload = true;
 }
 
+bool CodeLoader::registerPackageResource(VescPackage pkg)
+{
+    unregisterPackageResource();
+
+    if (pkg.resourceData.isEmpty()) {
+        return false;
+    }
+
+    mRegisteredResourceData = pkg.resourceData;
+
+    if (QResource::registerResource(
+            reinterpret_cast<const uchar*>(mRegisteredResourceData.constData()),
+            VESC_PKG_RESOURCE_ROOT)) {
+        qDebug() << "Registered package resource from memory";
+        return true;
+    }
+
+    mRegisteredResourceData.clear();
+    qWarning() << "Failed to register package resource";
+    return false;
+}
+
+void CodeLoader::unregisterPackageResource()
+{
+    if (!mRegisteredResourceData.isEmpty()) {
+        QResource::unregisterResource(
+            reinterpret_cast<const uchar*>(mRegisteredResourceData.constData()),
+            VESC_PKG_RESOURCE_ROOT);
+        mRegisteredResourceData.clear();
+    }
+}
+
 bool CodeLoader::createPackageFromDescription(QString path, VescPackage *pkgRes, bool reduceLisp)
 {
     QFile f(path);
@@ -1242,6 +1291,23 @@ bool CodeLoader::createPackageFromDescription(QString path, VescPackage *pkgRes,
     if (prop.isValid()) {
         pkg.qmlIsFullscreen = prop.toBool();
         qDebug() << "QML fullscreen:" << pkg.qmlIsFullscreen;
+    }
+
+    prop = qmlItem->property("pkgRcc");
+    if (prop.isValid()) {
+        auto resourcePath = prop.toString();
+
+        if (!resourcePath.isEmpty()) {
+            QFile f(resourcePath);
+            if (f.open(QIODevice::ReadOnly)) {
+                pkg.resourceData = f.readAll();
+                f.close();
+                qDebug() << "Package resource found!";
+            } else {
+                qWarning() << "Could not open resource file.";
+                result = false;
+            }
+        }
     }
 
     prop = qmlItem->property("pkgOutput");

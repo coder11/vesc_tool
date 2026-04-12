@@ -1222,6 +1222,7 @@ public:
     Q_PROPERTY(bool isLibrary MEMBER isLibrary)
     Q_PROPERTY(bool loadOk MEMBER loadOk)
     Q_PROPERTY(QByteArray compressedData MEMBER compressedData)
+    Q_PROPERTY(QByteArray resourceData MEMBER resourceData)
 
     VescPackage () {
         name = "VESC Package Name";
@@ -1237,6 +1238,7 @@ public:
     QByteArray lispData;
     QString qmlFile;
     QString pkgDescQml;
+    QByteArray resourceData;
     bool qmlIsFullscreen;
     bool isLibrary;
     bool loadOk;
