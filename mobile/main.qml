@@ -22,6 +22,7 @@ import QtQuick.Controls 2.10
 import QtQuick.Controls.Material 2.2
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.10
+import QtMultimedia 5.15
 
 import Vedder.vesc.vescinterface 1.0
 import Vedder.vesc.commands 1.0
@@ -981,6 +982,9 @@ ApplicationWindow {
             }
 
             hwUiObj = Qt.createQmlObject(VescIf.qmlHw(), uiHw, "HwUi")
+            if (!hwUiObj) {
+                console.warn("HwUi: Qt.createQmlObject failed (check QML warnings / missing QML plugins for imports)")
+            }
             mainSwipeView.insertItem(1, uiHwPage)
             tabBar.insertItem(1, uiHwButton)
             uiHwPage.visible = true
@@ -1008,6 +1012,9 @@ ApplicationWindow {
             }
 
             appUiObj = Qt.createQmlObject(VescIf.qmlApp(), uiApp, "AppUi")
+            if (!appUiObj) {
+                console.warn("AppUi: Qt.createQmlObject failed (check QML warnings / missing QML plugins for imports)")
+            }
             mainSwipeView.insertItem(1, uiAppPage)
             tabBar.insertItem(1, uiAppButton)
             uiAppPage.visible = true

@@ -90,7 +90,10 @@ stdenv.mkDerivation {
     runHook postInstall
   '';
 
-  buildInputs = [ libsForQt5.qtbase ];
+  buildInputs = [
+    libsForQt5.qtbase
+    libsForQt5.qtmultimedia
+  ];
 
   nativeBuildInputs = [
     cmake
@@ -100,6 +103,7 @@ stdenv.mkDerivation {
     libsForQt5.qtconnectivity
     libsForQt5.qtpositioning
     libsForQt5.qtserialport
+    libsForQt5.qtmultimedia
     libsForQt5.qtgraphicaleffects
     libsForQt5.wrapQtAppsHook
 
