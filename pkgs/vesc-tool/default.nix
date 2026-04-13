@@ -13,7 +13,10 @@
   cmake,
   copyDesktopItems,
   gcc-arm-embedded-7,
+  libgbm,
+  libGL,
   libsForQt5,
+  mesa,
   makeDesktopItem,
   stdenv,
   tree,
@@ -90,7 +93,16 @@ stdenv.mkDerivation {
     runHook postInstall
   '';
 
-  buildInputs = [ libsForQt5.qtbase ];
+  buildInputs = [
+    libGL
+    libsForQt5.qtbase
+    libsForQt5.qtwayland
+  ];
+
+  qtWrapperArgs = [
+    "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mesa libgbm ]}"
+    "--set __EGL_VENDOR_LIBRARY_DIRS ${mesa}/share/glvnd/egl_vendor.d"
+  ];
 
   nativeBuildInputs = [
     cmake

@@ -44,7 +44,7 @@
         packages = selfPkgs // {
           default = selfPkgs.vesc-tool;
           # Same SDK/NDK bundle as used by vesc-tool-android-release (androidenv).
-          vesc-android-sdk = selfPkgs.android-sdk-vesc;
+          vesc-android-sdk = selfPkgs.android-sdk-vesc.androidsdk;
           # Qt 5.15.2 Android host tools (fixed-output / aqtinstall); qmake at …/5.15.2/android/bin.
           qt-515-android = selfPkgs.qt-515-android;
         };
@@ -59,7 +59,7 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [ selfPkgs.vesc-tool ];
           packages = [
-            selfPkgs.android-sdk-vesc
+            selfPkgs.android-sdk-vesc.androidsdk
             selfPkgs.qt-515-android
             selfPkgs.vesc-tool-android-release
           ];
