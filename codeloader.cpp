@@ -971,10 +971,23 @@ bool CodeLoader::installVescPackage(VescPackage pkg)
     }
 
     bool res = true;
-    QByteArray qml;
+    VByteArray qml;
 
     if (!pkg.qmlFile.isEmpty()) {
-        qml = qmlCompress(pkg.qmlFile);
+        qml.vbAppendUint32(VESC_QML_BLOB_MAGIC);
+
+        QByteArray qmlCompressed = qmlCompress(pkg.qmlFile);
+        qml.vbAppendString("qml");
+        qml.vbAppendInt32(qmlCompressed.size());
+        qml.append(qmlCompressed);
+
+        if (!pkg.resourceData.isEmpty()) {
+            qml.vbAppendString("rcc");
+            qml.vbAppendInt32(pkg.resourceData.size());
+            qml.append(pkg.resourceData);
+        }
+
+        qml = qCompress(qml, 9);
         res = qmlErase(qml.size() + 100);
 
         if (res) {

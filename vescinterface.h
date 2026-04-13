@@ -374,6 +374,7 @@ private:
     QString mQmlHw;
     bool mQmlAppLoaded;
     QString mQmlApp;
+    QByteArray mQmlAppRccData;
 
     QTimer *mTimer;
     Packet *mPacket;
@@ -489,6 +490,7 @@ private:
 
     void updateFwRx(bool fwRx);
     void setLastConnectionType(conn_t type);
+    void loadQmlAppBlob(QByteArray decompressed);
 
 };
 
