@@ -31,6 +31,7 @@
 #include "lzokay/lzokay.hpp"
 #include "vescinterface.h"
 #include "utility.h"
+#include "codeloader.h"
 #include "heatshrink/heatshrinkif.h"
 
 #ifdef HAS_SERIALPORT
@@ -4086,8 +4087,7 @@ void VescInterface::fwVersionReceived(FW_RX_PARAMS params)
                 auto qmlData = f.readAll();
                 f.close();
 
-                mQmlApp = QString::fromUtf8(qUncompress(qmlData));
-                mQmlAppLoaded = true;
+                loadQmlAppBlob(qUncompress(qmlData));
                 emitStatusMessage("Got cached qmlui App", true);
                 cacheLoadOk = true;
             }
@@ -4126,8 +4126,7 @@ void VescInterface::fwVersionReceived(FW_RX_PARAMS params)
                 }
 
                 if (qmlData.size() == lenQmlLast) {
-                    mQmlApp = QString::fromUtf8(qUncompress(qmlData));
-                    mQmlAppLoaded = true;
+                    loadQmlAppBlob(qUncompress(qmlData));
                     emitStatusMessage("Got qmlui App", true);
 
                     if (!confCacheFile.isEmpty()) {
@@ -4883,6 +4882,52 @@ QString VescInterface::qmlApp()
     return mQmlAppLoaded ? mQmlApp : "";
 }
 
+void VescInterface::loadQmlAppBlob(QByteArray decompressed)
+{
+    if (!mQmlAppRccData.isEmpty()) {
+        QResource::unregisterResource(
+            reinterpret_cast<const uchar*>(mQmlAppRccData.constData()),
+            VESC_PKG_RESOURCE_ROOT);
+        mQmlAppRccData.clear();
+    }
+
+    VByteArray vb(decompressed);
+    quint32 magic = 0;
+    if (vb.size() >= 8) {
+        magic = vb.vbPopFrontUint32();
+    }
+
+    if (magic == VESC_QML_BLOB_MAGIC) {
+        // Extract qml and rcc from the new format of merged qml/rcc blobs
+        while (!vb.isEmpty()) {
+            QString name = vb.vbPopFrontString();
+            if (name.isEmpty()) {
+                break;
+            }
+
+            auto len = vb.vbPopFrontInt32();
+            auto data = vb.left(len);
+            vb.remove(0, len);
+
+            if (name == "qml") {
+                mQmlApp = QString::fromUtf8(qUncompress(data));
+                mQmlAppLoaded = true;
+            } else if (name == "rcc") {
+                mQmlAppRccData = data;
+                QResource::registerResource(
+                    reinterpret_cast<const uchar*>(mQmlAppRccData.constData()),
+                    VESC_PKG_RESOURCE_ROOT);
+            } else {
+                qWarning() << "Unknown QML blob section:" << name << "- skipping" << len << "bytes";
+            }
+        }
+    } else {
+        // Backwards compatibility for legacy pure qmls
+        mQmlApp = QString::fromUtf8(decompressed);
+        mQmlAppLoaded = true;
+    }
+}
+
 void VescInterface::updateFwRx(bool fwRx)
 {
     bool change = mFwVersionReceived != fwRx;
@@ -4896,6 +4941,13 @@ void VescInterface::updateFwRx(bool fwRx)
         mCustomConfigRxDone = false;
         mQmlHwLoaded = false;
         mQmlAppLoaded = false;
+
+        if (!mQmlAppRccData.isEmpty()) {
+            QResource::unregisterResource(
+                reinterpret_cast<const uchar*>(mQmlAppRccData.constData()),
+                VESC_PKG_RESOURCE_ROOT);
+            mQmlAppRccData.clear();
+        }
     }
 }
 

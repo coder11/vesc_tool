@@ -29,6 +29,11 @@
 
 static const QString VESC_PKG_RESOURCE_ROOT = "/vesc_pkg";
 
+// Magic constant to differentiate between merged qml/rcc blobs and legacy pure qmls 
+// 7e5c -> vesc
+// 0001 -> version 1
+static const quint32 VESC_QML_BLOB_MAGIC = 0x7e5c0001;
+
 class CodeLoader : public QObject
 {
     Q_OBJECT
