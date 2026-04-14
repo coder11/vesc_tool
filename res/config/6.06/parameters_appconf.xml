@@ -2280,6 +2280,38 @@ p, li { white-space: pre-wrap; }
             <enumNames>IMU_FILTER_MEDIUM</enumNames>
             <enumNames>IMU_FILTER_HIGH</enumNames>
         </imu_conf.filter>
+        <imu_conf.accel_fs>
+            <longName>Accelerometer Full Scale</longName>
+            <type>4</type>
+            <transmittable>1</transmittable>
+            <description>&lt;!DOCTYPE HTML PUBLIC &quot;-//W3C//DTD HTML 4.0//EN&quot; &quot;http://www.w3.org/TR/REC-html40/strict.dtd&quot;&gt;
+&lt;html&gt;&lt;head&gt;&lt;meta name=&quot;qrichtext&quot; content=&quot;1&quot; /&gt;&lt;style type=&quot;text/css&quot;&gt;
+p, li { white-space: pre-wrap; }
+&lt;/style&gt;&lt;/head&gt;&lt;body style=&quot; font-family:'Roboto'; ; font-weight:400; font-style:normal;&quot;&gt;
+&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Set the accelerometer full-scale range.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</description>
+            <cDefine>APPCONF_IMU_ACCEL_FS</cDefine>
+            <valInt>3</valInt>
+            <enumNames>IMU_ACCEL_FS_2G</enumNames>
+            <enumNames>IMU_ACCEL_FS_4G</enumNames>
+            <enumNames>IMU_ACCEL_FS_8G</enumNames>
+            <enumNames>IMU_ACCEL_FS_16G</enumNames>
+        </imu_conf.accel_fs>
+        <imu_conf.gyro_fs>
+            <longName>Gyroscope Full Scale</longName>
+            <type>4</type>
+            <transmittable>1</transmittable>
+            <description>&lt;!DOCTYPE HTML PUBLIC &quot;-//W3C//DTD HTML 4.0//EN&quot; &quot;http://www.w3.org/TR/REC-html40/strict.dtd&quot;&gt;
+&lt;html&gt;&lt;head&gt;&lt;meta name=&quot;qrichtext&quot; content=&quot;1&quot; /&gt;&lt;style type=&quot;text/css&quot;&gt;
+p, li { white-space: pre-wrap; }
+&lt;/style&gt;&lt;/head&gt;&lt;body style=&quot; font-family:'Roboto'; ; font-weight:400; font-style:normal;&quot;&gt;
+&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Set the gyroscope full-scale range.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</description>
+            <cDefine>APPCONF_IMU_GYRO_FS</cDefine>
+            <valInt>3</valInt>
+            <enumNames>IMU_GYRO_FS_250DPS</enumNames>
+            <enumNames>IMU_GYRO_FS_500DPS</enumNames>
+            <enumNames>IMU_GYRO_FS_1000DPS</enumNames>
+            <enumNames>IMU_GYRO_FS_2000DPS</enumNames>
+        </imu_conf.gyro_fs>
         <imu_conf.accel_lowpass_filter_x>
             <longName>Accel lowpass filter X</longName>
             <type>1</type>
@@ -2804,6 +2836,8 @@ p, li { white-space: pre-wrap; }
         <ser>imu_conf.type</ser>
         <ser>imu_conf.mode</ser>
         <ser>imu_conf.filter</ser>
+        <ser>imu_conf.accel_fs</ser>
+        <ser>imu_conf.gyro_fs</ser>
         <ser>imu_conf.accel_lowpass_filter_x</ser>
         <ser>imu_conf.accel_lowpass_filter_y</ser>
         <ser>imu_conf.accel_lowpass_filter_z</ser>
@@ -3003,6 +3037,8 @@ p, li { white-space: pre-wrap; }
                     <param>imu_conf.use_magnetometer</param>
                     <param>imu_conf.sample_rate_hz</param>
                     <param>imu_conf.filter</param>
+                    <param>imu_conf.accel_fs</param>
+                    <param>imu_conf.gyro_fs</param>
                     <param>imu_conf.accel_lowpass_filter_x</param>
                     <param>imu_conf.accel_lowpass_filter_y</param>
                     <param>imu_conf.accel_lowpass_filter_z</param>
