@@ -229,7 +229,7 @@ QString Utility::vescToolChangeLog()
 
 QString Utility::aboutText()
 {
-    return tr("<b>VESC® Tool %1</b><br>"
+    return tr("<b>VESC® Tool %1</b><br><b>coder11 modded (pacakge format)</b><br>"
           #if VT_IS_TEST_VERSION
               "Test Version %2<br>"
           #endif
