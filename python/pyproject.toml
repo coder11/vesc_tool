@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
+
+[project]
+name = "vesc-py"
+version = "0.1.0"
+description = "Pure-Python programmatic API for VESC hardware"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2",
+    "pyserial>=3.5",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vesc_py"]
+
+[tool.mypy]
+strict = true
+files = ["src/vesc_py", "examples"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
