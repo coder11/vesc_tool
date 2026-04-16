@@ -37,6 +37,11 @@ from matplotlib.artist import Artist
 
 from vesc_py import VescClient, list_serial_ports, udp_scan
 
+# Recv timeout matches one plot frame (library default 1s would cap updates ~1 Hz on miss).
+_PLOT_REFRESH_HZ = 60.0
+_PLOT_PERIOD_S = 1.0 / _PLOT_REFRESH_HZ
+_PLOT_INTERVAL_MS = 1000.0 / _PLOT_REFRESH_HZ
+
 
 def scan_and_print_serial() -> None:
     """Print discovered serial ports with VESC/ESP markers."""
@@ -131,7 +136,9 @@ def run_live_plot(client: VescClient, mask: int, history: int = 200) -> None:
 
         return (line_r, line_p, line_y, line_ax, line_ay, line_az)
 
-    _anim = FuncAnimation(fig, update, interval=50, blit=True, cache_frame_data=False)
+    _anim = FuncAnimation(
+        fig, update, interval=_PLOT_INTERVAL_MS, blit=True, cache_frame_data=False
+    )
     plt.tight_layout()
     plt.show()
 
@@ -159,11 +166,11 @@ def main() -> None:
 
     if args.serial:
         print(f"Connecting via serial: {args.serial}")
-        client = VescClient.connect_serial(args.serial)
+        client = VescClient.connect_serial(args.serial, timeout=_PLOT_PERIOD_S)
     else:
         host, _, port_str = args.tcp.rpartition(":")
         print(f"Connecting via TCP: {host}:{port_str}")
-        client = VescClient.connect_tcp(host, int(port_str))
+        client = VescClient.connect_tcp(host, int(port_str), timeout=_PLOT_PERIOD_S)
 
     fw = client.fw_version
     if fw:
