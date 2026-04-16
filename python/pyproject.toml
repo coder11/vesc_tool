@@ -1,6 +1,6 @@
 [build-system]
 requires = ["hatchling"]
-build-backend = "hatchling.backends"
+build-backend = "hatchling.build"
 
 [project]
 name = "vesc-py"
@@ -15,16 +15,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "mypy", "pylint"]
+dev = ["pytest", "mypy", "pylint", "poethepoet>=0.32"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vesc_py"]
 
-[tool.uv.scripts]
+[tool.poe.tasks]
 lint = "pylint src/vesc_py"
 typecheck = "mypy --strict src/vesc_py examples"
 test = "pytest"
-check = "uv run lint && uv run typecheck && uv run test"
+
+[tool.poe.tasks.check]
+sequence = ["lint", "typecheck", "test"]
 
 [tool.mypy]
 strict = true

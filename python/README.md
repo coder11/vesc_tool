@@ -136,13 +136,15 @@ types, wire types, and enum labels in serialization order
 
 ## Development scripts
 
-All dev commands are defined in `pyproject.toml` and run via `uv run`:
+Dev tasks use [poethepoet](https://github.com/nat-n/poethepoet) (`[tool.poe.tasks]` in `pyproject.toml`):
 
 ```bash
-uv run lint        # pylint on the library
-uv run typecheck   # mypy --strict on library + examples
-uv run test        # pytest
-uv run check       # all three in sequence (stops on first failure)
+uv sync --extra dev
+
+uv run poe lint        # pylint on the library
+uv run poe typecheck   # mypy --strict on library + examples
+uv run poe test        # pytest
+uv run poe check       # lint, then typecheck, then test (stops on first failure)
 ```
 
 ## License
