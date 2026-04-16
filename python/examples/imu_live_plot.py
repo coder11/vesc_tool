@@ -15,6 +15,21 @@ import math
 import sys
 from collections import deque
 
+import matplotlib
+
+# Agg is the default in many headless setups; FuncAnimation + plt.show() needs a GUI backend.
+if sys.platform == "darwin":
+    _GUI_BACKENDS = ("MacOSX", "TkAgg", "QtAgg", "Qt5Agg")
+else:
+    _GUI_BACKENDS = ("TkAgg", "QtAgg", "Qt5Agg")
+
+for _name in _GUI_BACKENDS:
+    try:
+        matplotlib.use(_name, force=True)
+        break
+    except (ImportError, ValueError):
+        continue
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
@@ -51,6 +66,13 @@ def scan_and_print_udp(timeout: float = 3.0) -> None:
 
 def run_live_plot(client: VescClient, mask: int, history: int = 200) -> None:
     """Run a matplotlib live plot of IMU data."""
+    if matplotlib.get_backend().lower() == "agg":
+        raise RuntimeError(
+            "No interactive matplotlib backend is available (still using Agg). "
+            "Install a GUI toolkit (e.g. python3-tk / tkinter, or PyQt5/PyQt6), "
+            "ensure DISPLAY is set for X11/Wayland, and unset MPLBACKEND if it forces Agg."
+        )
+
     RAD2DEG = 180.0 / math.pi
 
     roll_hist: deque[float] = deque(maxlen=history)
