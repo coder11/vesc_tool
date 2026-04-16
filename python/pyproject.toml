@@ -15,10 +15,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "mypy"]
+dev = ["pytest", "mypy", "pylint"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vesc_py"]
+
+[tool.uv.scripts]
+lint = "pylint src/vesc_py"
+typecheck = "mypy --strict src/vesc_py examples"
+test = "pytest"
+check = "uv run lint && uv run typecheck && uv run test"
 
 [tool.mypy]
 strict = true

@@ -16,6 +16,7 @@
             ps.numpy
             ps.pytest
             ps.mypy
+            ps.pylint
           ]);
         in {
           python = pkgs.mkShell {
