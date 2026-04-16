@@ -9,22 +9,17 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          python = pkgs.python312.withPackages (ps: [
-            ps.pydantic
-            ps.pyserial
-            ps.matplotlib
-            ps.numpy
-            ps.pytest
-            ps.mypy
-            ps.pylint
-          ]);
-        in {
-          python = pkgs.mkShell {
-            packages = [ python pkgs.uv ];
-            shellHook = ''
-              export PYTHONPATH="$PWD/src:''${PYTHONPATH:-}"
-            '';
+          # PyPI wheels (numpy, matplotlib, …) link libstdc++; NixOS has no default FHS path.
+          linuxPyPiLdPath = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          '';
+          pyShell = pkgs.mkShell {
+            packages = [ pkgs.uv ];
+            shellHook = linuxPyPiLdPath;
           };
+        in {
+          default = pyShell;
+          python = pyShell;
         }
       );
     };

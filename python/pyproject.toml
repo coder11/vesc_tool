@@ -8,14 +8,19 @@ version = "0.1.0"
 description = "Pure-Python programmatic API for VESC hardware"
 requires-python = ">=3.12"
 dependencies = [
-    "pydantic>=2",
-    "pyserial>=3.5",
-    "matplotlib>=3.8",
-    "numpy>=1.26",
+    "pydantic==2.13.1",
+    "pyserial==3.5",
+    "matplotlib==3.10.8",
+    "numpy==2.4.4",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "mypy", "pylint", "poethepoet>=0.32"]
+dev = [
+    "pytest==9.0.3",
+    "mypy==1.20.1",
+    "pylint==4.0.5",
+    "poethepoet==0.44.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vesc_py"]

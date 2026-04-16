@@ -24,12 +24,14 @@ all public data structures
 
 ```bash
 cd python
-nix develop .#python
-pytest
+nix develop
+uv sync --extra dev
+uv run poe test    # or: uv run pytest
 ```
 
-The Nix devShell provides Python 3.12 with all dependencies pre-installed and
-sets `PYTHONPATH` to `src/` automatically.
+The Nix devShell adds `uv` and, on Linux, sets `LD_LIBRARY_PATH` so PyPI binary
+wheels (e.g. NumPy) can find `libstdc++.so.6`. Python and packages still come
+from `uv sync` (`pyproject.toml` / `uv.lock`).
 
 ### uv / pip
 
