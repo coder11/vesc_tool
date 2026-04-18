@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from examples.config_tui import format_value, step_numeric_value, validate_numeric_text
+from textual.widgets import Select
+
+from examples.config_tui import (
+    _select_value_is_empty,
+    format_value,
+    step_numeric_value,
+    validate_numeric_text,
+)
 from vesc_py.config_schema import CfgType, ConfigParam
 
 
@@ -49,3 +56,9 @@ def test_keyboard_step_clamps_to_range() -> None:
 def test_double_display_respects_decimals() -> None:
     param = ConfigParam(type=CfgType.DOUBLE, decimals_double=3)
     assert format_value(param, 1.23456) == "1.235"
+
+
+def test_empty_select_sentinels_are_ignored() -> None:
+    assert _select_value_is_empty(Select.BLANK)
+    assert _select_value_is_empty(Select.NULL)
+    assert not _select_value_is_empty(0)

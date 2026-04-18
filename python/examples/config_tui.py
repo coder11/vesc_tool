@@ -125,6 +125,10 @@ def format_value(param: ConfigParam, value: object) -> str:
     return str(value)
 
 
+def _select_value_is_empty(value: object) -> bool:
+    return value is Select.BLANK or value is Select.NULL
+
+
 def step_numeric_value(
     param: ConfigParam,
     value: object,
@@ -705,9 +709,13 @@ class ConfigTuiApp(App[None]):
             self._populate_tree()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if self.selected is None or event.select.id != "enum-editor" or event.value is Select.BLANK:
+        if (
+            self.selected is None
+            or event.select.id != "enum-editor"
+            or _select_value_is_empty(event.value)
+        ):
             return
-        self._commit_value(self.selected, int(event.value))
+        self._commit_value(self.selected, int(cast(int, event.value)))
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         if self.selected is None or event.switch.id != "bool-editor":
