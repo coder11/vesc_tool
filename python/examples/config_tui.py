@@ -628,8 +628,9 @@ class ConfigTuiApp(App[None]):
         elif param.type == CfgType.ENUM:
             editor = self.query_one("#enum-editor", Select)
             options = [(label, index) for index, label in enumerate(param.enum_names)]
-            editor.set_options(options)
-            editor.value = int(value)
+            with editor.prevent(Select.Changed):
+                editor.set_options(options)
+                editor.value = int(value)
             editor.styles.display = "block"
         elif param.type == CfgType.BOOL:
             editor = self.query_one("#bool-editor", Switch)
@@ -714,6 +715,8 @@ class ConfigTuiApp(App[None]):
             or event.select.id != "enum-editor"
             or _select_value_is_empty(event.value)
         ):
+            return
+        if self.current[self.selected.kind][self.selected.name] == event.value:
             return
         self._commit_value(self.selected, int(cast(int, event.value)))
 
