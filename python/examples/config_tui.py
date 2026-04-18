@@ -193,11 +193,40 @@ class ConfirmModal(ModalScreen[bool]):
             yield Label(self._title)
             yield Static(self._message)
             with Horizontal(id="dialog-buttons"):
-                yield Button(self._confirm_label, variant="error", id="confirm")
-                yield Button("Cancel", id="cancel")
+                confirm_key = self._confirm_label[:1].lower()
+                yield Button(
+                    f"{self._confirm_label} ({confirm_key})",
+                    variant="error",
+                    id="confirm",
+                )
+                yield Button("Cancel (c)", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#confirm", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm")
+
+    def _focus_button(self, direction: int) -> None:
+        button_ids = ("confirm", "cancel")
+        focused_id = getattr(self.focused, "id", None)
+        index = button_ids.index(focused_id) if focused_id in button_ids else 0
+        next_id = button_ids[(index + direction) % len(button_ids)]
+        self.query_one(f"#{next_id}", Button).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.character.lower() if event.character is not None else event.key.lower()
+        if key in {"left", "right"}:
+            self._focus_button(-1 if key == "left" else 1)
+            event.stop()
+            return
+        if key == self._confirm_label[:1].lower():
+            self.dismiss(True)
+            event.stop()
+            return
+        if key in {"c", "escape"}:
+            self.dismiss(False)
+            event.stop()
 
 
 class ApplyChangesModal(ModalScreen[bool]):
@@ -242,11 +271,35 @@ class ApplyChangesModal(ModalScreen[bool]):
                 table.add_row(*row)
             yield table
             with Horizontal(id="apply-buttons"):
-                yield Button("Apply", variant="success", id="apply")
-                yield Button("Cancel", id="cancel")
+                yield Button("Apply (a)", variant="success", id="apply")
+                yield Button("Cancel (c)", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#apply", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "apply")
+
+    def _focus_button(self, direction: int) -> None:
+        button_ids = ("apply", "cancel")
+        focused_id = getattr(self.focused, "id", None)
+        index = button_ids.index(focused_id) if focused_id in button_ids else 0
+        next_id = button_ids[(index + direction) % len(button_ids)]
+        self.query_one(f"#{next_id}", Button).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.character.lower() if event.character is not None else event.key.lower()
+        if key in {"left", "right"}:
+            self._focus_button(-1 if key == "left" else 1)
+            event.stop()
+            return
+        if key == "a":
+            self.dismiss(True)
+            event.stop()
+            return
+        if key in {"c", "escape"}:
+            self.dismiss(False)
+            event.stop()
 
 
 class HelpModal(ModalScreen[None]):
@@ -890,6 +943,19 @@ def _connect_and_load(
     return client, mc_schema, app_schema, mc_values, app_values
 
 
+def _connection_refused_message(endpoint: str, port: int) -> str:
+    return "\n".join(
+        [
+            f"Could not connect to VESC Tool TCP server at {endpoint}: connection refused.",
+            "",
+            "Start VESC Tool with tcpServer enabled, then retry. For example:",
+            f"  vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer {port}",
+            "",
+            "If VESC Tool is already running, check the host and port passed to --tcp.",
+        ]
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Edit VESC motor/app configs over tcpServer")
     parser.add_argument("--tcp", type=_parse_tcp_endpoint, required=True, metavar="HOST:PORT")
@@ -902,9 +968,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     endpoint = f"{host}:{port}"
     client: VescClient | None = None
     try:
-        client, mc_schema, app_schema, mc_values, app_values = _connect_and_load(
-            host, port, args.timeout, args.config_dir
-        )
+        try:
+            client, mc_schema, app_schema, mc_values, app_values = _connect_and_load(
+                host, port, args.timeout, args.config_dir
+            )
+        except ConnectionRefusedError:
+            raise SystemExit(_connection_refused_message(endpoint, port)) from None
         app = ConfigTuiApp(
             client=client,
             endpoint=endpoint,
