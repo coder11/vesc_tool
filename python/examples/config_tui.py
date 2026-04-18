@@ -792,8 +792,33 @@ class ConfigTuiApp(App[None]):
             self._set_status("Value clamped to XML range")
         return True
 
+    def _focus_next_skip_search(self, direction: int) -> bool:
+        focus_chain = self.screen.focus_chain
+        if not focus_chain:
+            return False
+
+        focused = self.focused
+        try:
+            start = focus_chain.index(focused) if focused is not None else -1
+        except ValueError:
+            start = -1
+
+        for offset in range(1, len(focus_chain) + 1):
+            candidate = focus_chain[(start + direction * offset) % len(focus_chain)]
+            if getattr(candidate, "id", None) != "search":
+                candidate.focus()
+                return True
+        return False
+
     def on_key(self, event: events.Key) -> None:
         focused = self.focused
+        if event.key in {"tab", "shift+tab"}:
+            direction = -1 if event.key == "shift+tab" else 1
+            if self._focus_next_skip_search(direction):
+                event.prevent_default()
+                event.stop()
+            return
+
         if focused is not None and getattr(focused, "id", None) == "value-input":
             if event.key == "up" and self._step_selected(1):
                 event.stop()
