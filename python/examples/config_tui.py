@@ -578,6 +578,7 @@ class ConfigTuiApp(App[None]):
         self._config_nodes.clear()
         self._tree_labels.clear()
         query = self.query_one("#search", Input).value.strip()
+        expand_matches = len(query) >= 2
 
         config_labels: tuple[tuple[ConfigKind, str], tuple[ConfigKind, str]] = (
             ("mcconf", "Motor Config"),
@@ -586,7 +587,7 @@ class ConfigTuiApp(App[None]):
         for kind, label in config_labels:
             kind_node = tree.root.add(label, data=kind)
             self._config_nodes[kind] = kind_node
-            if kind == self.active_kind:
+            if expand_matches or kind == self.active_kind:
                 kind_node.expand()
             schema = self.schemas[kind]
             for group_name, subgroups in self._groups_for_schema(schema):
@@ -627,16 +628,16 @@ class ConfigTuiApp(App[None]):
                         continue
                     if group_node is None:
                         group_node = kind_node.add(group_name)
-                        if kind == self.active_kind:
+                        if expand_matches or kind == self.active_kind:
                             group_node.expand()
                     subgroup_node = group_node.add(subgroup_name)
-                    if kind == self.active_kind:
+                    if expand_matches or kind == self.active_kind:
                         subgroup_node.expand()
                     for section_label, visible_items in visible_sections:
                         parent_node = subgroup_node
                         if section_label is not None:
                             parent_node = subgroup_node.add(section_label)
-                            if kind == self.active_kind:
+                            if expand_matches or kind == self.active_kind:
                                 parent_node.expand()
                         for item in visible_items:
                             ref = ParamRef(kind, item)
