@@ -612,10 +612,10 @@ class ConfigTuiApp(App[None]):
                         subgroup_node.expand()
                     for item in visible_items:
                         if item.startswith("::sep::"):
-                            subgroup_node.add(item.removeprefix("::sep::"))
+                            subgroup_node.add_leaf(item.removeprefix("::sep::"))
                             continue
                         ref = ParamRef(kind, item)
-                        node = subgroup_node.add(self._node_label(ref), data=ref)
+                        node = subgroup_node.add_leaf(self._node_label(ref), data=ref)
                         self._tree_labels[ref] = node
 
         tree.root.expand()
