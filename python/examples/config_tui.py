@@ -334,6 +334,7 @@ class HelpModal(ModalScreen[None]):
                     "r: revert selected field",
                     "R: revert all fields",
                     "ctrl+s: review and apply changes",
+                    "t: toggle dark/light theme",
                     "q or ctrl+c: quit and discard unsaved edits",
                     "escape: cancel editor/search focus",
                 ]
@@ -431,6 +432,7 @@ class ConfigTuiApp(App[None]):
         Binding("a", "switch_config('appconf')", "App (quicknav)", show=True),
         Binding("r", "revert_selected", "Revert field", show=False),
         Binding("R", "revert_all", "Revert all", show=False),
+        Binding("t", "toggle_theme", "Theme", show=True),
         Binding("?", "help", "Help", show=True),
         Binding("q", "request_quit", "Quit", show=True),
         Binding("ctrl+c", "request_quit", "Quit", show=False),
@@ -867,6 +869,11 @@ class ConfigTuiApp(App[None]):
 
     def action_focus_search(self) -> None:
         self.query_one("#search", Input).focus()
+
+    def action_toggle_theme(self) -> None:
+        self.action_toggle_dark()
+        mode = "dark" if self.theme == "textual-dark" else "light"
+        self._set_status(f"Theme: {mode}")
 
     def action_switch_config(self, kind: str) -> None:
         if kind not in {"mcconf", "appconf"}:
