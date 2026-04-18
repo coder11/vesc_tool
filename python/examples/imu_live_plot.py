@@ -47,8 +47,7 @@ from vesc_py import ImuValues, VescClient, udp_scan
 DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
 DEFAULT_MASK = 0x003F  # roll/pitch/yaw + accelerometer, the fields plotted below.
 DEFAULT_POLL_HZ = 50.0
-PLOT_REFRESH_HZ = 30.0
-PLOT_INTERVAL_MS = 1000.0 / PLOT_REFRESH_HZ
+DEFAULT_REFRESH_HZ = 30.0
 
 
 @dataclass(frozen=True)
@@ -179,7 +178,12 @@ def require_interactive_backend() -> None:
         )
 
 
-def run_live_plot(poller: ImuPoller, history: int = 300) -> None:
+def run_live_plot(
+    poller: ImuPoller,
+    *,
+    history: int = 300,
+    refresh_hz: float = DEFAULT_REFRESH_HZ,
+) -> None:
     """Run a matplotlib live plot of IMU data."""
     require_interactive_backend()
 
@@ -202,7 +206,7 @@ def run_live_plot(poller: ImuPoller, history: int = 300) -> None:
     (line_p,) = ax_rpy.plot(x, zeros, label="Pitch")
     (line_y,) = ax_rpy.plot(x, zeros, label="Yaw")
     ax_rpy.set_ylabel("Degrees")
-    ax_rpy.set_ylim(-180, 180)
+    ax_rpy.set_ylim(-360, 360)
     ax_rpy.legend(loc="upper left")
     ax_rpy.grid(True, alpha=0.3)
 
@@ -210,7 +214,7 @@ def run_live_plot(poller: ImuPoller, history: int = 300) -> None:
     (line_ay,) = ax_acc.plot(x, zeros, label="Acc Y")
     (line_az,) = ax_acc.plot(x, zeros, label="Acc Z")
     ax_acc.set_ylabel("g")
-    ax_acc.set_ylim(-4, 4)
+    ax_acc.set_ylim(-8, 8)
     ax_acc.legend(loc="upper left")
     ax_acc.grid(True, alpha=0.3)
 
@@ -244,8 +248,9 @@ def run_live_plot(poller: ImuPoller, history: int = 300) -> None:
 
         return (line_r, line_p, line_y, line_ax, line_ay, line_az, status)
 
+    interval_ms = 1000.0 / refresh_hz
     _anim = FuncAnimation(
-        fig, update, interval=PLOT_INTERVAL_MS, blit=False, cache_frame_data=False
+        fig, update, interval=interval_ms, blit=False, cache_frame_data=False
     )
     plt.tight_layout()
     plt.show()
@@ -294,6 +299,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="IMU poll rate in Hz (default: 50).",
     )
     parser.add_argument(
+        "--refresh-rate",
+        type=float,
+        default=DEFAULT_REFRESH_HZ,
+        metavar="HZ",
+        help="Plot redraw rate in Hz (default: 30).",
+    )
+    parser.add_argument(
         "--history",
         type=int,
         default=300,
@@ -320,6 +332,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.rate <= 0.0:
         raise SystemExit("--rate must be greater than 0")
+    if args.refresh_rate <= 0.0:
+        raise SystemExit("--refresh-rate must be greater than 0")
     if args.history <= 0:
         raise SystemExit("--history must be greater than 0")
     if args.timeout <= 0.0:
@@ -345,7 +359,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if fw is not None:
             print(f"Firmware: {fw.major}.{fw.minor:02d}  HW: {fw.hw}")
         poller.start()
-        run_live_plot(poller, history=args.history)
+        run_live_plot(poller, history=args.history, refresh_hz=args.refresh_rate)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
