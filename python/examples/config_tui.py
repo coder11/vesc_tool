@@ -341,11 +341,6 @@ class ConfigTuiApp(App[None]):
         margin: 1 0;
     }
 
-    #actions {
-        height: auto;
-        margin: 1 0;
-    }
-
     #enum-editor, #bool-editor, #value-input {
         display: none;
     }
@@ -437,9 +432,6 @@ class ConfigTuiApp(App[None]):
                     yield Static("", id="validation")
                 yield Static("", id="original")
                 yield Static("", id="description")
-                with Horizontal(id="actions"):
-                    yield Button("Apply", variant="success", id="apply-main")
-                    yield Button("Quit", id="quit-main")
         yield Static("", id="status")
         yield Footer()
 
@@ -733,12 +725,6 @@ class ConfigTuiApp(App[None]):
             if checkbox.value:
                 value |= 1 << index
         self._commit_value(self.selected, value)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "apply-main":
-            self.action_apply_changes()
-        elif event.button.id == "quit-main":
-            self.action_request_quit()
 
     def _step_selected(self, direction: int, multiplier: int = 1) -> bool:
         if self.selected is None:
