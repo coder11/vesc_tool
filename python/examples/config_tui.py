@@ -590,18 +590,38 @@ class ConfigTuiApp(App[None]):
             for group_name, subgroups in self._groups_for_schema(schema):
                 group_node: TreeNode[object] | None = None
                 for subgroup_name, items in subgroups:
-                    visible_items = [
-                        item
-                        for item in items
-                        if item.startswith("::sep::")
-                        or self._matches_query(query, kind, group_name, subgroup_name, item)
-                    ]
-                    visible_items = [
-                        item
-                        for item in visible_items
-                        if item.startswith("::sep::") or item in schema.params
-                    ]
-                    if not any(not item.startswith("::sep::") for item in visible_items):
+                    sections: list[tuple[str | None, list[str]]] = []
+                    section_label: str | None = None
+                    section_items: list[str] = []
+                    for item in items:
+                        if item.startswith("::sep::"):
+                            if section_items:
+                                sections.append((section_label, section_items))
+                            section_label = item.removeprefix("::sep::")
+                            section_items = []
+                        elif item in schema.params:
+                            section_items.append(item)
+                    if section_items:
+                        sections.append((section_label, section_items))
+
+                    visible_sections: list[tuple[str | None, list[str]]] = []
+                    query_lower = query.lower()
+                    for section_label, section_items in sections:
+                        section_matches = bool(
+                            query_lower
+                            and section_label is not None
+                            and query_lower in section_label.lower()
+                        )
+                        visible_items = [
+                            item
+                            for item in section_items
+                            if section_matches
+                            or self._matches_query(query, kind, group_name, subgroup_name, item)
+                        ]
+                        if visible_items:
+                            visible_sections.append((section_label, visible_items))
+
+                    if not visible_sections:
                         continue
                     if group_node is None:
                         group_node = kind_node.add(group_name)
@@ -610,13 +630,16 @@ class ConfigTuiApp(App[None]):
                     subgroup_node = group_node.add(subgroup_name)
                     if kind == self.active_kind:
                         subgroup_node.expand()
-                    for item in visible_items:
-                        if item.startswith("::sep::"):
-                            subgroup_node.add_leaf(item.removeprefix("::sep::"))
-                            continue
-                        ref = ParamRef(kind, item)
-                        node = subgroup_node.add_leaf(self._node_label(ref), data=ref)
-                        self._tree_labels[ref] = node
+                    for section_label, visible_items in visible_sections:
+                        parent_node = subgroup_node
+                        if section_label is not None:
+                            parent_node = subgroup_node.add(section_label)
+                            if kind == self.active_kind:
+                                parent_node.expand()
+                        for item in visible_items:
+                            ref = ParamRef(kind, item)
+                            node = parent_node.add_leaf(self._node_label(ref), data=ref)
+                            self._tree_labels[ref] = node
 
         tree.root.expand()
 
