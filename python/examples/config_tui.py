@@ -330,10 +330,10 @@ class HelpModal(ModalScreen[None]):
                     "pageup/pagedown: adjust numeric editor by 10x step",
                     "enter: edit/commit",
                     "/: search",
-                    "m / p: switch to motor/app config",
+                    "m / a: quicknav to motor/app config",
                     "r: revert selected field",
                     "R: revert all fields",
-                    "ctrl+s or a: review and apply changes",
+                    "ctrl+s: review and apply changes",
                     "q or ctrl+c: quit and discard unsaved edits",
                     "escape: cancel editor/search focus",
                 ]
@@ -427,9 +427,8 @@ class ConfigTuiApp(App[None]):
     BINDINGS = [
         Binding("/", "focus_search", "Search", show=True),
         Binding("ctrl+s", "apply_changes", "Apply", show=True),
-        Binding("a", "apply_changes", "Apply", show=False),
-        Binding("m", "switch_config('mcconf')", "Motor", show=True),
-        Binding("p", "switch_config('appconf')", "App", show=True),
+        Binding("m", "switch_config('mcconf')", "Motor (quicknav)", show=True),
+        Binding("a", "switch_config('appconf')", "App (quicknav)", show=True),
         Binding("r", "revert_selected", "Revert field", show=False),
         Binding("R", "revert_all", "Revert all", show=False),
         Binding("?", "help", "Help", show=True),
@@ -465,6 +464,7 @@ class ConfigTuiApp(App[None]):
         self.active_kind: ConfigKind = "mcconf"
         self.selected: ParamRef | None = None
         self._checkboxes: list[Checkbox] = []
+        self._config_nodes: dict[ConfigKind, TreeNode[object]] = {}
         self._tree_labels: dict[ParamRef, TreeNode[object]] = {}
 
     def compose(self) -> ComposeResult:
@@ -575,6 +575,7 @@ class ConfigTuiApp(App[None]):
         tree = self.query_one("#tree", Tree)
         tree.clear()
         tree.root.set_label("Configs")
+        self._config_nodes.clear()
         self._tree_labels.clear()
         query = self.query_one("#search", Input).value.strip()
 
@@ -584,6 +585,7 @@ class ConfigTuiApp(App[None]):
         )
         for kind, label in config_labels:
             kind_node = tree.root.add(label, data=kind)
+            self._config_nodes[kind] = kind_node
             if kind == self.active_kind:
                 kind_node.expand()
             schema = self.schemas[kind]
@@ -869,10 +871,11 @@ class ConfigTuiApp(App[None]):
         if kind not in {"mcconf", "appconf"}:
             return
         self.active_kind = cast(ConfigKind, kind)
-        self.selected = None
         self._refresh_tabs()
-        self._populate_tree()
-        self._set_status(f"Showing {'motor' if kind == 'mcconf' else 'app'} config")
+        tree = self.query_one("#tree", Tree)
+        tree.focus()
+        tree.move_cursor(self._config_nodes.get(self.active_kind), animate=True)
+        self._set_status(f"Focused {'motor' if kind == 'mcconf' else 'app'} config")
 
     def action_revert_selected(self) -> None:
         if self.selected is None:
