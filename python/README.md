@@ -89,14 +89,15 @@ for device in udp_scan(timeout=3.0):
 ### Live IMU plot
 
 ```bash
-python examples/imu_live_plot.py --serial /dev/ttyACM0
+vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102
+python examples/imu_live_plot.py
 python examples/imu_live_plot.py --tcp 192.168.1.100:65102
-python examples/imu_live_plot.py --scan-serial
 python examples/imu_live_plot.py --scan-udp
 ```
 
-The `--mask` flag controls which IMU fields are requested (default `0x1FF` =
-roll/pitch/yaw + accelerometer + gyroscope).
+The live plot uses the VESC Tool `--tcpServer` bridge by default at
+`127.0.0.1:65102`. The `--mask` flag controls which IMU fields are requested
+(default `0x003f` = roll/pitch/yaw + accelerometer).
 
 ## Project structure
 
