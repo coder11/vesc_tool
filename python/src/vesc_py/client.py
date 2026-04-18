@@ -5,21 +5,19 @@ from __future__ import annotations
 import socket
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 import serial  # type: ignore[import-untyped]
 
-from vesc_py.appconf import (
-    AppConfSchema,
-    deserialize_appconf,
-    load_appconf_xml,
-    serialize_appconf,
-)
 from vesc_py.buffer import VescBuffer
 from vesc_py.comm_ids import CommPacketId
-from vesc_py.config_paths import find_appconf_xml
+from vesc_py.config_paths import find_appconf_xml, find_mcconf_xml
+from vesc_py.config_schema import ConfigSchema, deserialize_config, serialize_config
 from vesc_py.fw_version import build_get_fw_version, parse_fw_version
 from vesc_py.imu import build_get_imu_data, parse_imu_data
+from vesc_py.appconf import load_appconf_xml
+from vesc_py.mcconf import load_mcconf_xml
 from vesc_py.models import FwVersion, ImuValues
 from vesc_py.packet import PacketDecoder, encode_packet
 
@@ -98,13 +96,16 @@ class VescClient:
         *,
         timeout: float = 1.0,
         fw_retries: int = 25,
+        config_dir: Path | None = None,
     ) -> None:
         self._transport = transport
         self._decoder = PacketDecoder()
         self._timeout = timeout
         self._fw: FwVersion | None = None
-        self._schema: AppConfSchema | None = None
+        self._appconf_schema: ConfigSchema | None = None
+        self._mcconf_schema: ConfigSchema | None = None
         self._fw_retries = fw_retries
+        self._config_dir = config_dir
 
     @classmethod
     def connect_serial(
@@ -140,8 +141,12 @@ class VescClient:
         return self._fw
 
     @property
-    def appconf_schema(self) -> AppConfSchema | None:
-        return self._schema
+    def appconf_schema(self) -> ConfigSchema | None:
+        return self._appconf_schema
+
+    @property
+    def mcconf_schema(self) -> ConfigSchema | None:
+        return self._mcconf_schema
 
     @staticmethod
     def _forward_can_payload(payload: bytes, can_id: int) -> bytes:
@@ -174,7 +179,7 @@ class VescClient:
         raise TimeoutError("No response from VESC")
 
     def _handshake(self) -> None:
-        """Request firmware version and load matching appconf XML."""
+        """Request firmware version and load matching config XML."""
         for attempt in range(self._fw_retries):
             self._send_command(build_get_fw_version())
             try:
@@ -195,8 +200,17 @@ class VescClient:
 
         if self._fw.major >= 0 and self._fw.minor >= 0:
             try:
-                xml_path = find_appconf_xml(self._fw.major, self._fw.minor)
-                self._schema = load_appconf_xml(xml_path)
+                app_xml_path = find_appconf_xml(
+                    self._fw.major, self._fw.minor, self._config_dir
+                )
+                self._appconf_schema = load_appconf_xml(app_xml_path)
+            except FileNotFoundError:
+                pass
+            try:
+                mc_xml_path = find_mcconf_xml(
+                    self._fw.major, self._fw.minor, self._config_dir
+                )
+                self._mcconf_schema = load_mcconf_xml(mc_xml_path)
             except FileNotFoundError:
                 pass
 
@@ -240,35 +254,62 @@ class VescClient:
         payload = self._recv_response()
         return parse_imu_data(payload)
 
-    def get_appconf(self) -> dict[str, object]:
-        """Read the current app configuration from the VESC."""
-        if self._schema is None:
-            raise RuntimeError("No appconf schema loaded (unknown firmware version?)")
-
+    def _get_config(
+        self,
+        request_cmd: CommPacketId,
+        response_cmds: set[CommPacketId],
+        schema: ConfigSchema,
+    ) -> dict[str, object]:
         buf = VescBuffer()
-        buf.append_uint8(CommPacketId.COMM_GET_APPCONF)
+        buf.append_uint8(request_cmd)
         self._send_command(buf.to_bytes())
-        payload = self._recv_response()
+        payload = self._recv_response(expected_cmds={int(cmd) for cmd in response_cmds})
 
-        if len(payload) < 1 or payload[0] not in (
-            CommPacketId.COMM_GET_APPCONF,
-            CommPacketId.COMM_GET_APPCONF_DEFAULT,
-        ):
+        if len(payload) < 1 or payload[0] not in response_cmds:
             raise ValueError(f"Unexpected response command: {payload[0] if payload else 'empty'}")
 
-        return deserialize_appconf(self._schema, payload[1:])
+        return deserialize_config(schema, payload[1:])
+
+    def _set_config(
+        self,
+        request_cmd: CommPacketId,
+        schema: ConfigSchema,
+        values: Mapping[str, object],
+        *,
+        wait_ack: bool = False,
+    ) -> None:
+        blob = serialize_config(schema, values)
+        buf = VescBuffer()
+        buf.append_uint8(request_cmd)
+        buf._buf.extend(blob)
+        self._send_command(buf.to_bytes())
+
+        if wait_ack:
+            self._recv_response(expected_cmds={int(request_cmd)})
+
+    def get_appconf(self) -> dict[str, object]:
+        """Read the current app configuration from the VESC."""
+        if self._appconf_schema is None:
+            raise RuntimeError("No appconf schema loaded (unknown firmware version?)")
+
+        return self._get_config(
+            CommPacketId.COMM_GET_APPCONF,
+            {CommPacketId.COMM_GET_APPCONF, CommPacketId.COMM_GET_APPCONF_DEFAULT},
+            self._appconf_schema,
+        )
 
     def set_appconf(
         self,
         values: dict[str, object],
         *,
         store: bool = True,
+        wait_ack: bool = False,
     ) -> None:
         """Write app configuration to the VESC.
 
         If *store* is False, uses COMM_SET_APPCONF_NO_STORE (temporary).
         """
-        if self._schema is None:
+        if self._appconf_schema is None:
             raise RuntimeError("No appconf schema loaded (unknown firmware version?)")
 
         cmd = (
@@ -276,11 +317,35 @@ class VescClient:
             if store
             else CommPacketId.COMM_SET_APPCONF_NO_STORE
         )
-        blob = serialize_appconf(self._schema, values)
-        buf = VescBuffer()
-        buf.append_uint8(cmd)
-        buf._buf.extend(blob)
-        self._send_command(buf.to_bytes())
+        self._set_config(cmd, self._appconf_schema, values, wait_ack=wait_ack)
+
+    def get_mcconf(self) -> dict[str, object]:
+        """Read the current motor configuration from the VESC."""
+        if self._mcconf_schema is None:
+            raise RuntimeError("No mcconf schema loaded (unknown firmware version?)")
+
+        return self._get_config(
+            CommPacketId.COMM_GET_MCCONF,
+            {CommPacketId.COMM_GET_MCCONF, CommPacketId.COMM_GET_MCCONF_DEFAULT},
+            self._mcconf_schema,
+        )
+
+    def set_mcconf(
+        self,
+        values: dict[str, object],
+        *,
+        wait_ack: bool = False,
+    ) -> None:
+        """Write motor configuration to the VESC."""
+        if self._mcconf_schema is None:
+            raise RuntimeError("No mcconf schema loaded (unknown firmware version?)")
+
+        self._set_config(
+            CommPacketId.COMM_SET_MCCONF,
+            self._mcconf_schema,
+            values,
+            wait_ack=wait_ack,
+        )
 
     def send_alive(self) -> None:
         """Send a COMM_ALIVE keepalive."""

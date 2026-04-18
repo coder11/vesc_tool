@@ -33,6 +33,52 @@ def _available_versions(config_dir: Path | None = None) -> list[tuple[int, int, 
     return versions
 
 
+def _version_miss_message(
+    fw_major: int,
+    fw_minor: int,
+    config_dir: Path | None = None,
+) -> str:
+    avail = _available_versions(config_dir)
+    version_strs = sorted(f"{m}.{n:02d}" for m, n, _ in avail)
+    return (
+        f"No config for firmware {fw_major}.{fw_minor:02d}. "
+        f"Available versions: {', '.join(version_strs)}"
+    )
+
+
+def find_config_dir(
+    fw_major: int,
+    fw_minor: int,
+    config_dir: Path | None = None,
+) -> Path:
+    """Find the local config directory for a given firmware version."""
+
+    for major, minor, dir_path in _available_versions(config_dir):
+        if major == fw_major and minor == fw_minor:
+            return dir_path
+
+    raise FileNotFoundError(_version_miss_message(fw_major, fw_minor, config_dir))
+
+
+def find_config_xml(
+    fw_major: int,
+    fw_minor: int,
+    kind: str,
+    config_dir: Path | None = None,
+) -> Path:
+    """Find a parameters_<kind>.xml file for a given firmware version."""
+
+    if kind not in {"appconf", "mcconf"}:
+        raise ValueError(f"Unsupported config kind: {kind}")
+
+    dir_path = find_config_dir(fw_major, fw_minor, config_dir)
+    path = dir_path / f"parameters_{kind}.xml"
+    if path.exists():
+        return path
+
+    raise FileNotFoundError(f"Config directory {dir_path} exists but {path.name} is missing")
+
+
 def find_appconf_xml(
     fw_major: int,
     fw_minor: int,
@@ -42,18 +88,15 @@ def find_appconf_xml(
 
     Raises FileNotFoundError with a list of available versions on miss.
     """
-    for major, minor, dir_path in _available_versions(config_dir):
-        if major == fw_major and minor == fw_minor:
-            appconf = dir_path / "parameters_appconf.xml"
-            if appconf.exists():
-                return appconf
-            raise FileNotFoundError(
-                f"Config directory {dir_path} exists but parameters_appconf.xml is missing"
-            )
 
-    avail = _available_versions(config_dir)
-    version_strs = sorted(f"{m}.{n:02d}" for m, n, _ in avail)
-    raise FileNotFoundError(
-        f"No config for firmware {fw_major}.{fw_minor:02d}. "
-        f"Available versions: {', '.join(version_strs)}"
-    )
+    return find_config_xml(fw_major, fw_minor, "appconf", config_dir)
+
+
+def find_mcconf_xml(
+    fw_major: int,
+    fw_minor: int,
+    config_dir: Path | None = None,
+) -> Path:
+    """Find the parameters_mcconf.xml for a given firmware version."""
+
+    return find_config_xml(fw_major, fw_minor, "mcconf", config_dir)

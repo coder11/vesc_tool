@@ -12,6 +12,7 @@ dependencies = [
     "pyserial==3.5",
     "matplotlib==3.10.8",
     "numpy==2.4.4",
+    "textual==8.2.3",
 ]
 
 [project.optional-dependencies]

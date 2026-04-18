@@ -988,6 +988,6 @@ requires-dist = [
     { name = "pylint", marker = "extra == 'dev'", specifier = "==4.0.5" },
     { name = "pyserial", specifier = "==3.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.3" },
-    { name = "textual", specifier = ">=0.79.0" },
+    { name = "textual", specifier = "==8.2.3" },
 ]
 provides-extras = ["dev"]

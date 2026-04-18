@@ -3,6 +3,7 @@ from __future__ import annotations
 from vesc_py.buffer import VescBuffer
 from vesc_py.client import Transport, VescClient
 from vesc_py.comm_ids import CommPacketId
+from vesc_py.config_schema import CfgType, ConfigParam, ConfigSchema, VescTx, serialize_config
 from vesc_py.packet import PacketDecoder, encode_packet
 
 
@@ -58,3 +59,55 @@ def test_get_fw_version_can_wraps_request() -> None:
             CommPacketId.COMM_FW_VERSION,
         ]
     )
+
+
+def _tiny_schema(name: str = "mcconf") -> ConfigSchema:
+    return ConfigSchema(
+        name=name,
+        params={
+            "value": ConfigParam(
+                name="value",
+                type=CfgType.INT,
+                vTx=VescTx.INT32,
+                val_int=1,
+            )
+        },
+        ser_order=["value"],
+    )
+
+
+def test_get_mcconf_sends_command_and_deserializes() -> None:
+    schema = _tiny_schema("mcconf")
+    payload = bytes([CommPacketId.COMM_GET_MCCONF]) + serialize_config(schema, {"value": 42})
+    transport = FakeTransport([encode_packet(payload)])
+    client = VescClient(transport, timeout=0.1)
+    client._mcconf_schema = schema
+
+    result = client.get_mcconf()
+
+    assert result["value"] == 42
+    assert _decode_sent_payload(transport.sent[0]) == bytes([CommPacketId.COMM_GET_MCCONF])
+
+
+def test_set_mcconf_waits_for_ack() -> None:
+    schema = _tiny_schema("mcconf")
+    transport = FakeTransport([encode_packet(bytes([CommPacketId.COMM_SET_MCCONF]))])
+    client = VescClient(transport, timeout=0.1)
+    client._mcconf_schema = schema
+
+    client.set_mcconf({"value": 7}, wait_ack=True)
+
+    payload = _decode_sent_payload(transport.sent[0])
+    assert payload[0] == CommPacketId.COMM_SET_MCCONF
+
+
+def test_set_appconf_waits_for_ack() -> None:
+    schema = _tiny_schema("appconf")
+    transport = FakeTransport([encode_packet(bytes([CommPacketId.COMM_SET_APPCONF]))])
+    client = VescClient(transport, timeout=0.1)
+    client._appconf_schema = schema
+
+    client.set_appconf({"value": 8}, wait_ack=True)
+
+    payload = _decode_sent_payload(transport.sent[0])
+    assert payload[0] == CommPacketId.COMM_SET_APPCONF

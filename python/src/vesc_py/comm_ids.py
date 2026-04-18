@@ -7,6 +7,9 @@ from enum import IntEnum
 
 class CommPacketId(IntEnum):
     COMM_FW_VERSION = 0
+    COMM_SET_MCCONF = 13
+    COMM_GET_MCCONF = 14
+    COMM_GET_MCCONF_DEFAULT = 15
     COMM_SET_APPCONF = 16
     COMM_GET_APPCONF = 17
     COMM_GET_APPCONF_DEFAULT = 18
