@@ -143,11 +143,22 @@ class VescClient:
     def appconf_schema(self) -> AppConfSchema | None:
         return self._schema
 
+    @staticmethod
+    def _forward_can_payload(payload: bytes, can_id: int) -> bytes:
+        """Wrap a command payload in COMM_FORWARD_CAN for a target CAN ID."""
+        if not 0 <= can_id <= 253:
+            raise ValueError(f"CAN ID {can_id} out of range [0, 253]")
+        return bytes([CommPacketId.COMM_FORWARD_CAN, can_id]) + payload
+
     def _send_command(self, payload: bytes) -> None:
         """Encode and send a command payload."""
         self._transport.send(encode_packet(payload))
 
-    def _recv_response(self, timeout: float | None = None) -> bytes:
+    def _recv_response(
+        self,
+        timeout: float | None = None,
+        expected_cmds: set[int] | None = None,
+    ) -> bytes:
         """Receive and decode exactly one response payload."""
         t = timeout if timeout is not None else self._timeout
         deadline = time.monotonic() + t
@@ -157,7 +168,8 @@ class VescClient:
             raw = self._transport.recv(remaining)
             if raw:
                 for payload in self._decoder.process(raw):
-                    return payload
+                    if expected_cmds is None or (payload and payload[0] in expected_cmds):
+                        return payload
 
         raise TimeoutError("No response from VESC")
 
@@ -166,7 +178,10 @@ class VescClient:
         for attempt in range(self._fw_retries):
             self._send_command(build_get_fw_version())
             try:
-                payload = self._recv_response(timeout=0.2)
+                payload = self._recv_response(
+                    timeout=0.2,
+                    expected_cmds={int(CommPacketId.COMM_FW_VERSION)},
+                )
             except TimeoutError:
                 continue
 
@@ -185,13 +200,39 @@ class VescClient:
             except FileNotFoundError:
                 pass
 
-    def get_fw_version(self) -> FwVersion:
+    def get_fw_version(
+        self,
+        can_id: int | None = None,
+        timeout: float | None = None,
+    ) -> FwVersion:
         """Request firmware version from the VESC."""
-        self._send_command(build_get_fw_version())
-        payload = self._recv_response()
+        request = build_get_fw_version()
+        if can_id is not None:
+            request = self._forward_can_payload(request, can_id)
+        self._send_command(request)
+        payload = self._recv_response(
+            timeout=timeout,
+            expected_cmds={int(CommPacketId.COMM_FW_VERSION)},
+        )
         fw = parse_fw_version(payload)
-        self._fw = fw
+        if can_id is None:
+            self._fw = fw
         return fw
+
+    def scan_can(self, timeout: float | None = None) -> list[int]:
+        """Return CAN IDs reported by COMM_PING_CAN."""
+        buf = VescBuffer()
+        buf.append_uint8(CommPacketId.COMM_PING_CAN)
+        self._send_command(buf.to_bytes())
+        payload = self._recv_response(
+            timeout=timeout,
+            expected_cmds={int(CommPacketId.COMM_PING_CAN)},
+        )
+
+        if len(payload) < 1 or payload[0] != CommPacketId.COMM_PING_CAN:
+            raise ValueError(f"Unexpected response command: {payload[0] if payload else 'empty'}")
+
+        return list(payload[1:])
 
     def get_imu_data(self, mask: int = 0xFFFF) -> ImuValues:
         """Request IMU data with the given field mask."""
