@@ -134,13 +134,12 @@ def _scan_serial_tree(
 
 def _print_serial_tree(nodes: list[VescNode]) -> None:
     """Print discovered serial VESCs and their CAN children."""
-    print("VESC:")
     if not nodes:
-        print("  none")
+        print("No VESCs found.")
         return
 
     for node in nodes:
-        print(f"  {node.port.system_path}  {node.port.name}")
+        print(f"{node.port.system_path}:")
         print(f"    {_fw_label(node.fw)}")
         print("    CAN:")
         if node.can_error is not None:
