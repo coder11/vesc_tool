@@ -1021,6 +1021,21 @@ bool CodeLoader::installVescPackage(VescPackage pkg)
     return res;
 }
 
+bool CodeLoader::removeVescPackage()
+{
+    if (!mVesc) {
+        return false;
+    }
+
+    bool qmlOk = qmlErase(16);
+    bool lispOk = lispErase(16);
+
+    Utility::sleepWithEventLoop(500);
+    mVesc->reloadFirmware();
+
+    return qmlOk && lispOk;
+}
+
 bool CodeLoader::installVescPackage(QByteArray data)
 {
     return installVescPackage(unpackVescPackage(data));

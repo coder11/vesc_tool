@@ -391,15 +391,15 @@ void PageVescPackage::on_uninstallButton_clicked()
     dialog.setWindowModality(Qt::WindowModal);
     dialog.show();
 
-    mLoader.qmlErase(16);
-    mLoader.lispErase(16);
-
-    Utility::sleepWithEventLoop(500);
-    mVesc->reloadFirmware();
-
-    mVesc->emitMessageDialog(tr("Uninstall Package"),
-                             tr("Uninstallation Done!"),
-                             true);
+    if (mLoader.removeVescPackage()) {
+        mVesc->emitMessageDialog(tr("Uninstall Package"),
+                                 tr("Uninstallation Done!"),
+                                 true);
+    } else {
+        mVesc->emitMessageDialog(tr("Uninstall Package"),
+                                 tr("Uninstallation failed."),
+                                 false);
+    }
 }
 
 void PageVescPackage::on_installButton_clicked()

@@ -116,6 +116,8 @@ static void showHelp()
     qDebug() << "--bridgeAppData : Send app data (such as data from send-data in LispBM) to stdout.";
     qDebug() << "--offscreen : Use offscreen QPA so that X is not required for the CLI-mode.";
     qDebug() << "--downloadPackageArchive : Download package archive to application data directory.";
+    qDebug() << "--removeVescPackage : Connect and remove the QML/LispBM package from the device.";
+    qDebug() << "--installVescPackage [path] [--force] : Connect and install a .vescpkg file; --force skips isCompatible on install.";
 }
 
 #ifdef Q_OS_LINUX
@@ -342,6 +344,9 @@ int main(int argc, char *argv[])
     bool bridgeAppData = false;
     bool offscreen = false;
     bool downloadPackageArchive = false;
+    bool removeVescPackage = false;
+    QString installVescPackagePath = "";
+    bool force = false;
 
     // Arguments can be hard-coded in a build like this:
 //    qmlWindowSize = QSize(400, 800);
@@ -535,7 +540,7 @@ int main(int argc, char *argv[])
         if (str == "--canFwd") {
             if ((i + 1) < args.size()) {
                 i++;
-                canFwd = args.at(i).toInt(),
+                canFwd = args.at(i).toInt();
                 found = true;
             } else {
                 i++;
@@ -749,6 +754,28 @@ int main(int argc, char *argv[])
 
         if (str == "--downloadPackageArchive") {
             downloadPackageArchive = true;
+            found = true;
+        }
+
+        if (str == "--removeVescPackage") {
+            removeVescPackage = true;
+            found = true;
+        }
+
+        if (str == "--installVescPackage") {
+            if ((i + 1) < args.size()) {
+                i++;
+                installVescPackagePath = args.at(i);
+                found = true;
+            } else {
+                i++;
+                qCritical() << "No path to package file";
+                return 1;
+            }
+        }
+
+        if (str == "--force") {
+            force = true;
             found = true;
         }
 
@@ -1073,10 +1100,16 @@ int main(int argc, char *argv[])
     bool isMcConf = !getMcConfPath.isEmpty() || !setMcConfPath.isEmpty();
     bool isAppConf = !getAppConfPath.isEmpty() || !setAppConfPath.isEmpty();
     bool isCustomConf = !getCustomConfPath.isEmpty() || !setCustomConfPath.isEmpty();
+    bool isVescPkgCli = removeVescPackage || !installVescPackagePath.isEmpty();
+
+    if (isVescPkgCli && canFwd >= 0) {
+        qCritical() << "--canFwd is not supported with --removeVescPackage or --installVescPackage";
+        return 1;
+    }
 
     if (isMcConf || isAppConf || isCustomConf || !lispPath.isEmpty() ||
             eraseLisp || !firmwarePath.isEmpty() || uploadBootloaderBuiltin ||
-            queryDeviceFwParams || !fileForSdIn.isEmpty() || bridgeAppData) {
+            queryDeviceFwParams || !fileForSdIn.isEmpty() || bridgeAppData || isVescPkgCli) {
         if (offscreen) {
             qputenv("QT_QPA_PLATFORM", "offscreen");
         }
@@ -1179,6 +1212,35 @@ int main(int argc, char *argv[])
 
                 CodeLoader loader;
                 loader.setVesc(vesc);
+
+                if (removeVescPackage) {
+                    if (loader.removeVescPackage()) {
+                        qDebug() << "VESC package removed.";
+                    } else {
+                        qWarning() << "Could not remove VESC package";
+                        exitCode = -60;
+                    }
+                }
+
+                if (!installVescPackagePath.isEmpty()) {
+                    VescPackage pkg = loader.unpackVescPackageFromPath(installVescPackagePath);
+                    if (!pkg.loadOk) {
+                        qWarning() << "Could not install VESC package (invalid or unreadable file)";
+                        exitCode = -61;
+                    } else {
+                        if (!force && !loader.shouldShowPackage(pkg)) {
+                            qWarning() << "Incompatible package:"
+                                       << "The selected package reports that it is not compatible with"
+                                       << "the target device. Use --force to install anyway.";
+                            exitCode = -62;
+                        } else if (!loader.installVescPackage(pkg)) {
+                            qWarning() << "Could not install VESC package";
+                            exitCode = -61;
+                        } else {
+                            qDebug() << "VESC package installed.";
+                        }
+                    }
+                }
 
                 if (eraseLisp) {
                     if (loader.lispErase(16)) {
