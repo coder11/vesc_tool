@@ -50,6 +50,7 @@ DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
 DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_POLL_HZ = 50.0
 DEFAULT_REFRESH_HZ = 30.0
+DEFAULT_SPECTRUM_REFRESH_HZ = 2.0
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,8 @@ def run_live_plot(
     *,
     history: int = 300,
     refresh_hz: float = DEFAULT_REFRESH_HZ,
+    show_freq: bool = False,
+    spectrum_refresh_hz: float = DEFAULT_SPECTRUM_REFRESH_HZ,
 ) -> None:
     """Run a matplotlib live plot of IMU data."""
     require_interactive_backend()
@@ -200,11 +203,27 @@ def run_live_plot(
     gx_hist: deque[float] = deque(maxlen=history)
     gy_hist: deque[float] = deque(maxlen=history)
     gz_hist: deque[float] = deque(maxlen=history)
+    refresh_timestamp_hist: deque[float] = deque(maxlen=120)
+    last_sample_timestamp: float | None = None
+    spectrum_enabled = show_freq and spectrum_refresh_hz > 0.0
+    spectrum_period = 1.0 / spectrum_refresh_hz if spectrum_enabled else math.inf
+    next_spectrum_update = 0.0
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 9), sharex="col")
-    (ax_acc, ax_acc_freq), (ax_gyro, ax_gyro_freq), (ax_rpy, ax_rpy_freq) = axes
+    if show_freq:
+        fig, axes = plt.subplots(3, 2, figsize=(14, 9), sharex="col")
+        (ax_acc, ax_acc_freq), (ax_gyro, ax_gyro_freq), (ax_rpy, ax_rpy_freq) = axes
+    else:
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        ax_acc, ax_gyro, ax_rpy = np.asarray(axes).ravel()
+        ax_acc_freq = ax_gyro_freq = ax_rpy_freq = None
+
     fig.suptitle("VESC IMU Live Data")
-    status = fig.text(0.01, 0.01, "Waiting for IMU data...", fontsize=9)
+    status = fig.text(
+        0.01,
+        0.01,
+        "Waiting for IMU data... | Sample: measuring | Plot: measuring",
+        fontsize=9,
+    )
 
     x = np.arange(-history + 1, 1)
     zeros = [0.0] * history
@@ -237,83 +256,129 @@ def run_live_plot(
     ax_rpy.legend(loc="upper left")
     ax_rpy.grid(True, alpha=0.3)
 
-    (line_ax_freq,) = ax_acc_freq.plot([], [], label="Acc X")
-    (line_ay_freq,) = ax_acc_freq.plot([], [], label="Acc Y")
-    (line_az_freq,) = ax_acc_freq.plot([], [], label="Acc Z")
-    ax_acc_freq.set_title("Accel Data Frequency Analysis")
-    ax_acc_freq.set_ylabel("Magnitude")
-    ax_acc_freq.legend(loc="upper right")
-    ax_acc_freq.grid(True, alpha=0.3)
+    acc_freq_lines: tuple[Line2D, Line2D, Line2D] | None = None
+    gyro_freq_lines: tuple[Line2D, Line2D, Line2D] | None = None
+    rpy_freq_lines: tuple[Line2D, Line2D, Line2D] | None = None
+    frequency_artists: tuple[Artist, ...] = ()
+    if show_freq:
+        assert ax_acc_freq is not None
+        assert ax_gyro_freq is not None
+        assert ax_rpy_freq is not None
 
-    (line_gx_freq,) = ax_gyro_freq.plot([], [], label="Gyro X")
-    (line_gy_freq,) = ax_gyro_freq.plot([], [], label="Gyro Y")
-    (line_gz_freq,) = ax_gyro_freq.plot([], [], label="Gyro Z")
-    ax_gyro_freq.set_title("Gyro Data Frequency Analysis")
-    ax_gyro_freq.set_ylabel("Magnitude")
-    ax_gyro_freq.legend(loc="upper right")
-    ax_gyro_freq.grid(True, alpha=0.3)
+        (line_ax_freq,) = ax_acc_freq.plot([], [], label="Acc X")
+        (line_ay_freq,) = ax_acc_freq.plot([], [], label="Acc Y")
+        (line_az_freq,) = ax_acc_freq.plot([], [], label="Acc Z")
+        ax_acc_freq.set_title("Accel Data Frequency Analysis")
+        ax_acc_freq.set_ylabel("Magnitude")
+        ax_acc_freq.legend(loc="upper right")
+        ax_acc_freq.grid(True, alpha=0.3)
+        acc_freq_lines = (line_ax_freq, line_ay_freq, line_az_freq)
 
-    (line_r_freq,) = ax_rpy_freq.plot([], [], label="Roll")
-    (line_p_freq,) = ax_rpy_freq.plot([], [], label="Pitch")
-    (line_y_freq,) = ax_rpy_freq.plot([], [], label="Yaw")
-    ax_rpy_freq.set_title("RPY Data Frequency Analysis")
-    ax_rpy_freq.set_xlabel("Frequency (Hz)")
-    ax_rpy_freq.set_ylabel("Magnitude")
-    ax_rpy_freq.legend(loc="upper right")
-    ax_rpy_freq.grid(True, alpha=0.3)
+        (line_gx_freq,) = ax_gyro_freq.plot([], [], label="Gyro X")
+        (line_gy_freq,) = ax_gyro_freq.plot([], [], label="Gyro Y")
+        (line_gz_freq,) = ax_gyro_freq.plot([], [], label="Gyro Z")
+        ax_gyro_freq.set_title("Gyro Data Frequency Analysis")
+        ax_gyro_freq.set_ylabel("Magnitude")
+        ax_gyro_freq.legend(loc="upper right")
+        ax_gyro_freq.grid(True, alpha=0.3)
+        gyro_freq_lines = (line_gx_freq, line_gy_freq, line_gz_freq)
+
+        (line_r_freq,) = ax_rpy_freq.plot([], [], label="Roll")
+        (line_p_freq,) = ax_rpy_freq.plot([], [], label="Pitch")
+        (line_y_freq,) = ax_rpy_freq.plot([], [], label="Yaw")
+        ax_rpy_freq.set_title("RPY Data Frequency Analysis")
+        ax_rpy_freq.set_xlabel("Frequency (Hz)")
+        ax_rpy_freq.set_ylabel("Magnitude")
+        ax_rpy_freq.legend(loc="upper right")
+        ax_rpy_freq.grid(True, alpha=0.3)
+        rpy_freq_lines = (line_r_freq, line_p_freq, line_y_freq)
+
+        frequency_artists = acc_freq_lines + gyro_freq_lines + rpy_freq_lines
 
     def _pad(values: deque[float]) -> list[float]:
         padded = list(values)
         return [0.0] * (history - len(padded)) + padded
 
-    def _frequency_data(values: deque[float]) -> tuple[np.ndarray, np.ndarray]:
-        sample_count = min(len(values), len(timestamp_hist))
+    def _frequency_bins() -> tuple[int, np.ndarray, np.ndarray] | None:
+        sample_count = len(timestamp_hist)
         if sample_count < 2:
-            return np.array([]), np.array([])
+            return None
 
-        samples = np.asarray(list(values)[-sample_count:], dtype=float)
-        timestamps = np.asarray(list(timestamp_hist)[-sample_count:], dtype=float)
+        timestamps = np.asarray(timestamp_hist, dtype=float)
         sample_periods = np.diff(timestamps)
         sample_periods = sample_periods[sample_periods > 0.0]
         if sample_periods.size == 0:
-            return np.array([]), np.array([])
+            return None
 
         sample_period = float(np.median(sample_periods))
         if not np.isfinite(sample_period) or sample_period <= 0.0:
-            return np.array([]), np.array([])
+            return None
 
-        centered = samples - np.mean(samples)
         if sample_count > 2:
-            centered = centered * np.hanning(sample_count)
+            window = np.hanning(sample_count)
+        else:
+            window = np.ones(sample_count)
+
+        frequencies = np.fft.rfftfreq(sample_count, d=sample_period)
+        return sample_count, frequencies, window
+
+    def _frequency_magnitudes(
+        values: deque[float],
+        sample_count: int,
+        window: np.ndarray,
+    ) -> np.ndarray:
+        samples = np.asarray(values, dtype=float)[-sample_count:]
+        centered = samples - np.mean(samples)
+        centered = centered * window
 
         magnitudes = np.abs(np.fft.rfft(centered)) / sample_count
         if magnitudes.size > 2:
             magnitudes[1:-1] *= 2.0
-        frequencies = np.fft.rfftfreq(sample_count, d=sample_period)
-        return frequencies, magnitudes
+        return magnitudes
 
     def _update_frequency_axis(
         axis: Axes,
         lines: tuple[Line2D, Line2D, Line2D],
         values: tuple[deque[float], deque[float], deque[float]],
+        bins: tuple[int, np.ndarray, np.ndarray],
     ) -> None:
-        max_frequency = 0.0
-        has_data = False
+        sample_count, frequencies, window = bins
         for line, hist in zip(lines, values):
-            frequencies, magnitudes = _frequency_data(hist)
+            magnitudes = _frequency_magnitudes(hist, sample_count, window)
             line.set_data(frequencies, magnitudes)
-            if frequencies.size > 0:
-                max_frequency = max(max_frequency, float(frequencies[-1]))
-                has_data = True
 
-        if has_data:
-            axis.set_xlim(0.0, max_frequency)
-            axis.relim()
-            axis.autoscale_view(scalex=False, scaley=True)
+        axis.set_xlim(0.0, float(frequencies[-1]))
+        axis.relim()
+        axis.autoscale_view(scalex=False, scaley=True)
+
+    def _actual_refresh_hz() -> float | None:
+        if len(refresh_timestamp_hist) < 2:
+            return None
+
+        elapsed = refresh_timestamp_hist[-1] - refresh_timestamp_hist[0]
+        if elapsed <= 0.0:
+            return None
+
+        return (len(refresh_timestamp_hist) - 1) / elapsed
+
+    def _actual_sample_hz() -> float | None:
+        if len(timestamp_hist) < 2:
+            return None
+
+        elapsed = timestamp_hist[-1] - timestamp_hist[0]
+        if elapsed <= 0.0:
+            return None
+
+        return (len(timestamp_hist) - 1) / elapsed
 
     def update(_frame: int) -> tuple[Artist, ...]:
-        latest_timestamp: float | None = None
-        for sample in poller.drain():
+        nonlocal last_sample_timestamp, next_spectrum_update
+
+        now = time.monotonic()
+        refresh_timestamp_hist.append(now)
+        actual_refresh_hz = _actual_refresh_hz()
+        samples = poller.drain()
+        for sample in samples:
             imu = sample.values
             timestamp_hist.append(sample.timestamp)
             roll_hist.append(imu.roll * rad2deg)
@@ -325,38 +390,68 @@ def run_live_plot(
             gx_hist.append(imu.gyro_x)
             gy_hist.append(imu.gyro_y)
             gz_hist.append(imu.gyro_z)
-            latest_timestamp = sample.timestamp
+            last_sample_timestamp = sample.timestamp
 
-        line_ax.set_ydata(_pad(ax_hist))
-        line_ay.set_ydata(_pad(ay_hist))
-        line_az.set_ydata(_pad(az_hist))
-        line_gx.set_ydata(_pad(gx_hist))
-        line_gy.set_ydata(_pad(gy_hist))
-        line_gz.set_ydata(_pad(gz_hist))
-        line_r.set_ydata(_pad(roll_hist))
-        line_p.set_ydata(_pad(pitch_hist))
-        line_y.set_ydata(_pad(yaw_hist))
+        if samples:
+            line_ax.set_ydata(_pad(ax_hist))
+            line_ay.set_ydata(_pad(ay_hist))
+            line_az.set_ydata(_pad(az_hist))
+            line_gx.set_ydata(_pad(gx_hist))
+            line_gy.set_ydata(_pad(gy_hist))
+            line_gz.set_ydata(_pad(gz_hist))
+            line_r.set_ydata(_pad(roll_hist))
+            line_p.set_ydata(_pad(pitch_hist))
+            line_y.set_ydata(_pad(yaw_hist))
 
-        _update_frequency_axis(
-            ax_acc_freq,
-            (line_ax_freq, line_ay_freq, line_az_freq),
-            (ax_hist, ay_hist, az_hist),
-        )
-        _update_frequency_axis(
-            ax_gyro_freq,
-            (line_gx_freq, line_gy_freq, line_gz_freq),
-            (gx_hist, gy_hist, gz_hist),
-        )
-        _update_frequency_axis(
-            ax_rpy_freq,
-            (line_r_freq, line_p_freq, line_y_freq),
-            (roll_hist, pitch_hist, yaw_hist),
-        )
+            if spectrum_enabled and now >= next_spectrum_update:
+                bins = _frequency_bins()
+                if bins is not None:
+                    assert ax_acc_freq is not None
+                    assert ax_gyro_freq is not None
+                    assert ax_rpy_freq is not None
+                    assert acc_freq_lines is not None
+                    assert gyro_freq_lines is not None
+                    assert rpy_freq_lines is not None
 
-        if latest_timestamp is not None:
-            status.set_text(f"Last sample: {time.monotonic() - latest_timestamp:.2f}s ago")
-        elif poller.last_error is not None:
-            status.set_text(f"IMU read error: {poller.last_error}")
+                    _update_frequency_axis(
+                        ax_acc_freq,
+                        acc_freq_lines,
+                        (ax_hist, ay_hist, az_hist),
+                        bins,
+                    )
+                    _update_frequency_axis(
+                        ax_gyro_freq,
+                        gyro_freq_lines,
+                        (gx_hist, gy_hist, gz_hist),
+                        bins,
+                    )
+                    _update_frequency_axis(
+                        ax_rpy_freq,
+                        rpy_freq_lines,
+                        (roll_hist, pitch_hist, yaw_hist),
+                        bins,
+                    )
+                    next_spectrum_update = now + spectrum_period
+
+        if actual_refresh_hz is None:
+            plot_text = "Plot: measuring"
+        else:
+            plot_text = f"Plot: {actual_refresh_hz:.1f} Hz actual ({refresh_hz:.1f} Hz target)"
+
+        if poller.last_error is not None and not samples:
+            sample_text = f"IMU read error: {poller.last_error}"
+        elif last_sample_timestamp is not None:
+            actual_sample_hz = _actual_sample_hz()
+            if actual_sample_hz is None:
+                sample_text = f"Sample: measuring | Age: {now - last_sample_timestamp:.2f}s"
+            else:
+                sample_text = (
+                    f"Sample: {actual_sample_hz:.1f} Hz actual | "
+                    f"Age: {now - last_sample_timestamp:.2f}s"
+                )
+        else:
+            sample_text = "Waiting for IMU data..."
+        status.set_text(f"{sample_text} | {plot_text}")
 
         return (
             line_ax,
@@ -368,15 +463,7 @@ def run_live_plot(
             line_r,
             line_p,
             line_y,
-            line_ax_freq,
-            line_ay_freq,
-            line_az_freq,
-            line_gx_freq,
-            line_gy_freq,
-            line_gz_freq,
-            line_r_freq,
-            line_p_freq,
-            line_y_freq,
+            *frequency_artists,
             status,
         )
 
@@ -438,6 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plot redraw rate in Hz (default: 30).",
     )
     parser.add_argument(
+        "--show-freq",
+        action="store_true",
+        help="Show frequency-analysis plots. Hidden by default for faster redraws.",
+    )
+    parser.add_argument(
+        "--spectrum-refresh-rate",
+        type=float,
+        default=DEFAULT_SPECTRUM_REFRESH_HZ,
+        metavar="HZ",
+        help="Frequency-analysis redraw rate in Hz when --show-freq is set (default: 2).",
+    )
+    parser.add_argument(
         "--history",
         type=int,
         default=300,
@@ -466,6 +565,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--rate must be greater than 0")
     if args.refresh_rate <= 0.0:
         raise SystemExit("--refresh-rate must be greater than 0")
+    if args.spectrum_refresh_rate < 0.0:
+        raise SystemExit("--spectrum-refresh-rate must be greater than or equal to 0")
     if args.history <= 0:
         raise SystemExit("--history must be greater than 0")
     if args.timeout <= 0.0:
@@ -491,7 +592,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         if fw is not None:
             print(f"Firmware: {fw.major}.{fw.minor:02d}  HW: {fw.hw}")
         poller.start()
-        run_live_plot(poller, history=args.history, refresh_hz=args.refresh_rate)
+        run_live_plot(
+            poller,
+            history=args.history,
+            refresh_hz=args.refresh_rate,
+            show_freq=args.show_freq,
+            spectrum_refresh_hz=args.spectrum_refresh_rate,
+        )
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
