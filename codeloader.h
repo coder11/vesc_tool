@@ -59,6 +59,7 @@ public:
     bool installVescPackage(VescPackage pkg);
     Q_INVOKABLE bool installVescPackage(QByteArray data);
     Q_INVOKABLE bool installVescPackageFromPath(QString path);
+    Q_INVOKABLE bool removeVescPackage();
 
     Q_INVOKABLE static bool loadPackageArchiveResource();
     Q_INVOKABLE QVariantList reloadPackageArchive();
