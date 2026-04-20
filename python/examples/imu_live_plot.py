@@ -23,9 +23,10 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 
 from vesc_py import ImuValues, VescClient, udp_scan
 
@@ -34,7 +35,18 @@ DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_POLL_HZ = 50.0
 DEFAULT_REFRESH_HZ = 30.0
 DEFAULT_SPECTRUM_REFRESH_HZ = 2.0
+DEFAULT_STATUS_REFRESH_HZ = 4.0
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+ROLL_INDEX = 0
+PITCH_INDEX = 1
+YAW_INDEX = 2
+ACC_X_INDEX = 3
+ACC_Y_INDEX = 4
+ACC_Z_INDEX = 5
+GYRO_X_INDEX = 6
+GYRO_Y_INDEX = 7
+GYRO_Z_INDEX = 8
+IMU_PLOT_CHANNELS = 9
 
 
 @dataclass(frozen=True)
@@ -43,6 +55,87 @@ class ImuSample:
 
     timestamp: float
     values: ImuValues
+
+
+class ImuHistory:
+    """Fixed-size numeric history for the live curves."""
+
+    def __init__(self, history: int) -> None:
+        self._history = history
+        self._count = 0
+        self._timestamps: npt.NDArray[np.float64] = np.zeros(history, dtype=float)
+        self._values: npt.NDArray[np.float64] = np.zeros(
+            (IMU_PLOT_CHANNELS, history),
+            dtype=float,
+        )
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def latest_timestamp(self) -> float | None:
+        if self._count == 0:
+            return None
+        return float(self._timestamps[-1])
+
+    def channel(self, index: int) -> npt.NDArray[np.float64]:
+        return cast(npt.NDArray[np.float64], self._values[index])
+
+    def valid_channel(self, index: int) -> npt.NDArray[np.float64]:
+        if self._count == 0:
+            return self._values[index, :0]
+        return self._values[index, -self._count:]
+
+    def valid_timestamps(self) -> npt.NDArray[np.float64]:
+        if self._count == 0:
+            return self._timestamps[:0]
+        return self._timestamps[-self._count:]
+
+    def sample_hz(self) -> float | None:
+        if self._count < 2:
+            return None
+
+        timestamps = self.valid_timestamps()
+        elapsed = timestamps[-1] - timestamps[0]
+        if elapsed <= 0.0:
+            return None
+
+        return float((self._count - 1) / elapsed)
+
+    def append_samples(self, samples: Sequence[ImuSample], rad2deg: float) -> None:
+        sample_count = len(samples)
+        if sample_count == 0:
+            return
+
+        timestamps = np.empty(sample_count, dtype=float)
+        values = np.empty((IMU_PLOT_CHANNELS, sample_count), dtype=float)
+        for column, sample in enumerate(samples):
+            imu = sample.values
+            timestamps[column] = sample.timestamp
+            values[:, column] = (
+                imu.roll * rad2deg,
+                imu.pitch * rad2deg,
+                imu.yaw * rad2deg,
+                imu.acc_x,
+                imu.acc_y,
+                imu.acc_z,
+                imu.gyro_x,
+                imu.gyro_y,
+                imu.gyro_z,
+            )
+
+        if sample_count >= self._history:
+            self._timestamps[:] = timestamps[-self._history:]
+            self._values[:, :] = values[:, -self._history:]
+            self._count = self._history
+            return
+
+        self._timestamps[:-sample_count] = self._timestamps[sample_count:]
+        self._timestamps[-sample_count:] = timestamps
+        self._values[:, :-sample_count] = self._values[:, sample_count:]
+        self._values[:, -sample_count:] = values
+        self._count = min(self._history, self._count + sample_count)
 
 
 class ImuPoller:
@@ -207,27 +300,19 @@ def run_live_plot(
     refresh_hz: float = DEFAULT_REFRESH_HZ,
     show_freq: bool = False,
     spectrum_refresh_hz: float = DEFAULT_SPECTRUM_REFRESH_HZ,
+    antialias: bool = False,
 ) -> None:
     """Run a PyQtGraph live plot of IMU data."""
     pg, QtCore = import_pyqtgraph()
-    pg.setConfigOptions(antialias=True)
+    pg.setConfigOptions(antialias=antialias)
 
     rad2deg = 180.0 / math.pi
-    timestamp_hist: deque[float] = deque(maxlen=history)
-    roll_hist: deque[float] = deque(maxlen=history)
-    pitch_hist: deque[float] = deque(maxlen=history)
-    yaw_hist: deque[float] = deque(maxlen=history)
-    ax_hist: deque[float] = deque(maxlen=history)
-    ay_hist: deque[float] = deque(maxlen=history)
-    az_hist: deque[float] = deque(maxlen=history)
-    gx_hist: deque[float] = deque(maxlen=history)
-    gy_hist: deque[float] = deque(maxlen=history)
-    gz_hist: deque[float] = deque(maxlen=history)
+    imu_history = ImuHistory(history)
     refresh_timestamp_hist: deque[float] = deque(maxlen=120)
-    last_sample_timestamp: float | None = None
     spectrum_enabled = show_freq and spectrum_refresh_hz > 0.0
     spectrum_period = 1.0 / spectrum_refresh_hz if spectrum_enabled else math.inf
     next_spectrum_update = 0.0
+    next_status_update = 0.0
 
     x = np.arange(-history + 1, 1)
     zeros = np.zeros(history)
@@ -349,18 +434,15 @@ def run_live_plot(
             initial_y=empty,
         )
 
-    def _pad(values: deque[float]) -> np.ndarray:
-        padded = np.asarray(values, dtype=float)
-        if padded.size >= history:
-            return padded[-history:]
-        return np.concatenate((np.zeros(history - padded.size), padded))
+    def _set_curve_data(line: Any, y_values: np.ndarray) -> None:
+        line.setData(x=x, y=y_values)
 
     def _frequency_bins() -> tuple[int, np.ndarray, np.ndarray] | None:
-        sample_count = len(timestamp_hist)
+        sample_count = imu_history.count
         if sample_count < 2:
             return None
 
-        timestamps = np.asarray(timestamp_hist, dtype=float)
+        timestamps = imu_history.valid_timestamps()
         sample_periods = np.diff(timestamps)
         sample_periods = sample_periods[sample_periods > 0.0]
         if sample_periods.size == 0:
@@ -379,11 +461,11 @@ def run_live_plot(
         return sample_count, frequencies, window
 
     def _frequency_magnitudes(
-        values: deque[float],
+        values: np.ndarray,
         sample_count: int,
         window: np.ndarray,
     ) -> np.ndarray:
-        samples = np.asarray(values, dtype=float)[-sample_count:]
+        samples = values[-sample_count:]
         centered = samples - np.mean(samples)
         centered = centered * window
 
@@ -395,7 +477,7 @@ def run_live_plot(
     def _update_frequency_axis(
         axis: Any,
         lines: tuple[Any, Any, Any],
-        values: tuple[deque[float], deque[float], deque[float]],
+        values: tuple[np.ndarray, np.ndarray, np.ndarray],
         bins: tuple[int, np.ndarray, np.ndarray],
     ) -> None:
         sample_count, frequencies, window = bins
@@ -420,46 +502,26 @@ def run_live_plot(
         return (len(refresh_timestamp_hist) - 1) / elapsed
 
     def _actual_sample_hz() -> float | None:
-        if len(timestamp_hist) < 2:
-            return None
-
-        elapsed = timestamp_hist[-1] - timestamp_hist[0]
-        if elapsed <= 0.0:
-            return None
-
-        return (len(timestamp_hist) - 1) / elapsed
+        return imu_history.sample_hz()
 
     def update() -> None:
-        nonlocal last_sample_timestamp, next_spectrum_update
+        nonlocal next_spectrum_update, next_status_update
 
         now = time.monotonic()
         refresh_timestamp_hist.append(now)
-        actual_refresh_hz = _actual_refresh_hz()
         samples = poller.drain()
-        for sample in samples:
-            imu = sample.values
-            timestamp_hist.append(sample.timestamp)
-            roll_hist.append(imu.roll * rad2deg)
-            pitch_hist.append(imu.pitch * rad2deg)
-            yaw_hist.append(imu.yaw * rad2deg)
-            ax_hist.append(imu.acc_x)
-            ay_hist.append(imu.acc_y)
-            az_hist.append(imu.acc_z)
-            gx_hist.append(imu.gyro_x)
-            gy_hist.append(imu.gyro_y)
-            gz_hist.append(imu.gyro_z)
-            last_sample_timestamp = sample.timestamp
+        imu_history.append_samples(samples, rad2deg)
 
         if samples:
-            line_ax.setData(x, _pad(ax_hist))
-            line_ay.setData(x, _pad(ay_hist))
-            line_az.setData(x, _pad(az_hist))
-            line_gx.setData(x, _pad(gx_hist))
-            line_gy.setData(x, _pad(gy_hist))
-            line_gz.setData(x, _pad(gz_hist))
-            line_r.setData(x, _pad(roll_hist))
-            line_p.setData(x, _pad(pitch_hist))
-            line_y.setData(x, _pad(yaw_hist))
+            _set_curve_data(line_ax, imu_history.channel(ACC_X_INDEX))
+            _set_curve_data(line_ay, imu_history.channel(ACC_Y_INDEX))
+            _set_curve_data(line_az, imu_history.channel(ACC_Z_INDEX))
+            _set_curve_data(line_gx, imu_history.channel(GYRO_X_INDEX))
+            _set_curve_data(line_gy, imu_history.channel(GYRO_Y_INDEX))
+            _set_curve_data(line_gz, imu_history.channel(GYRO_Z_INDEX))
+            _set_curve_data(line_r, imu_history.channel(ROLL_INDEX))
+            _set_curve_data(line_p, imu_history.channel(PITCH_INDEX))
+            _set_curve_data(line_y, imu_history.channel(YAW_INDEX))
 
             if spectrum_enabled and now >= next_spectrum_update:
                 bins = _frequency_bins()
@@ -474,42 +536,60 @@ def run_live_plot(
                     _update_frequency_axis(
                         ax_acc_freq,
                         acc_freq_lines,
-                        (ax_hist, ay_hist, az_hist),
+                        (
+                            imu_history.valid_channel(ACC_X_INDEX),
+                            imu_history.valid_channel(ACC_Y_INDEX),
+                            imu_history.valid_channel(ACC_Z_INDEX),
+                        ),
                         bins,
                     )
                     _update_frequency_axis(
                         ax_gyro_freq,
                         gyro_freq_lines,
-                        (gx_hist, gy_hist, gz_hist),
+                        (
+                            imu_history.valid_channel(GYRO_X_INDEX),
+                            imu_history.valid_channel(GYRO_Y_INDEX),
+                            imu_history.valid_channel(GYRO_Z_INDEX),
+                        ),
                         bins,
                     )
                     _update_frequency_axis(
                         ax_rpy_freq,
                         rpy_freq_lines,
-                        (roll_hist, pitch_hist, yaw_hist),
+                        (
+                            imu_history.valid_channel(ROLL_INDEX),
+                            imu_history.valid_channel(PITCH_INDEX),
+                            imu_history.valid_channel(YAW_INDEX),
+                        ),
                         bins,
                     )
                     next_spectrum_update = now + spectrum_period
 
+        if now < next_status_update:
+            return
+
+        actual_refresh_hz = _actual_refresh_hz()
         if actual_refresh_hz is None:
             plot_text = "Plot: measuring"
         else:
             plot_text = f"Plot: {actual_refresh_hz:.1f} Hz actual ({refresh_hz:.1f} Hz target)"
 
+        latest_sample_timestamp = imu_history.latest_timestamp
         if poller.last_error is not None and not samples:
             sample_text = f"IMU read error: {poller.last_error}"
-        elif last_sample_timestamp is not None:
+        elif latest_sample_timestamp is not None:
             actual_sample_hz = _actual_sample_hz()
             if actual_sample_hz is None:
-                sample_text = f"Sample: measuring | Age: {now - last_sample_timestamp:.2f}s"
+                sample_text = f"Sample: measuring | Age: {now - latest_sample_timestamp:.2f}s"
             else:
                 sample_text = (
                     f"Sample: {actual_sample_hz:.1f} Hz actual | "
-                    f"Age: {now - last_sample_timestamp:.2f}s"
+                    f"Age: {now - latest_sample_timestamp:.2f}s"
                 )
         else:
             sample_text = "Waiting for IMU data..."
         status.setText(f"{sample_text} | {plot_text}")
+        next_status_update = now + (1.0 / DEFAULT_STATUS_REFRESH_HZ)
 
     timer = QtCore.QTimer()
     timer.setInterval(max(1, round(1000.0 / refresh_hz)))
@@ -583,6 +663,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show frequency-analysis plots. Hidden by default for faster redraws.",
     )
     parser.add_argument(
+        "--antialias",
+        action="store_true",
+        help="Render smoother lines at the cost of lower redraw performance.",
+    )
+    parser.add_argument(
         "--spectrum-refresh-rate",
         type=float,
         default=DEFAULT_SPECTRUM_REFRESH_HZ,
@@ -651,6 +736,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             refresh_hz=args.refresh_rate,
             show_freq=args.show_freq,
             spectrum_refresh_hz=args.spectrum_refresh_rate,
+            antialias=args.antialias,
         )
     except KeyboardInterrupt:
         print("\nStopped.")
