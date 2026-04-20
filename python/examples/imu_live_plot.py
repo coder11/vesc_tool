@@ -33,7 +33,6 @@ from vesc_py import ImuValues, VescClient, udp_scan
 DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
 DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_POLL_HZ = 50.0
-DEFAULT_REFRESH_HZ = 30.0
 DEFAULT_SPECTRUM_REFRESH_HZ = 2.0
 DEFAULT_STATUS_REFRESH_HZ = 4.0
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
@@ -297,7 +296,6 @@ def run_live_plot(
     poller: ImuPoller,
     *,
     history: int = 300,
-    refresh_hz: float = DEFAULT_REFRESH_HZ,
     show_freq: bool = False,
     spectrum_refresh_hz: float = DEFAULT_SPECTRUM_REFRESH_HZ,
     antialias: bool = False,
@@ -572,7 +570,7 @@ def run_live_plot(
         if actual_refresh_hz is None:
             plot_text = "Plot: measuring"
         else:
-            plot_text = f"Plot: {actual_refresh_hz:.1f} Hz actual ({refresh_hz:.1f} Hz target)"
+            plot_text = f"Plot: {actual_refresh_hz:.1f} Hz actual"
 
         latest_sample_timestamp = imu_history.latest_timestamp
         if poller.last_error is not None and not samples:
@@ -592,7 +590,7 @@ def run_live_plot(
         next_status_update = now + (1.0 / DEFAULT_STATUS_REFRESH_HZ)
 
     timer = QtCore.QTimer()
-    timer.setInterval(max(1, round(1000.0 / refresh_hz)))
+    timer.setInterval(0)
     timer.timeout.connect(update)
 
     def stop_timer(*_args: object) -> None:
@@ -651,13 +649,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="IMU poll rate in Hz (default: 50).",
     )
     parser.add_argument(
-        "--refresh-rate",
-        type=float,
-        default=DEFAULT_REFRESH_HZ,
-        metavar="HZ",
-        help="Plot redraw rate in Hz (default: 30).",
-    )
-    parser.add_argument(
         "--show-freq",
         action="store_true",
         help="Show frequency-analysis plots. Hidden by default for faster redraws.",
@@ -701,8 +692,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.rate <= 0.0:
         raise SystemExit("--rate must be greater than 0")
-    if args.refresh_rate <= 0.0:
-        raise SystemExit("--refresh-rate must be greater than 0")
     if args.spectrum_refresh_rate < 0.0:
         raise SystemExit("--spectrum-refresh-rate must be greater than or equal to 0")
     if args.history <= 0:
@@ -733,7 +722,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_live_plot(
             poller,
             history=args.history,
-            refresh_hz=args.refresh_rate,
             show_freq=args.show_freq,
             spectrum_refresh_hz=args.spectrum_refresh_rate,
             antialias=args.antialias,
