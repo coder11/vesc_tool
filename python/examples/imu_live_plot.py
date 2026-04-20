@@ -40,12 +40,14 @@ for _name in _GUI_BACKENDS:
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
+from matplotlib.axes import Axes
 from matplotlib.artist import Artist
+from matplotlib.lines import Line2D
 
 from vesc_py import ImuValues, VescClient, udp_scan
 
 DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
-DEFAULT_MASK = 0x003F  # roll/pitch/yaw + accelerometer, the fields plotted below.
+DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_POLL_HZ = 50.0
 DEFAULT_REFRESH_HZ = 30.0
 
@@ -188,71 +190,201 @@ def run_live_plot(
     require_interactive_backend()
 
     rad2deg = 180.0 / math.pi
+    timestamp_hist: deque[float] = deque(maxlen=history)
     roll_hist: deque[float] = deque(maxlen=history)
     pitch_hist: deque[float] = deque(maxlen=history)
     yaw_hist: deque[float] = deque(maxlen=history)
     ax_hist: deque[float] = deque(maxlen=history)
     ay_hist: deque[float] = deque(maxlen=history)
     az_hist: deque[float] = deque(maxlen=history)
+    gx_hist: deque[float] = deque(maxlen=history)
+    gy_hist: deque[float] = deque(maxlen=history)
+    gz_hist: deque[float] = deque(maxlen=history)
 
-    fig, (ax_rpy, ax_acc) = plt.subplots(2, 1, figsize=(10, 7))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 9), sharex="col")
+    (ax_acc, ax_acc_freq), (ax_gyro, ax_gyro_freq), (ax_rpy, ax_rpy_freq) = axes
     fig.suptitle("VESC IMU Live Data")
     status = fig.text(0.01, 0.01, "Waiting for IMU data...", fontsize=9)
 
-    x = np.arange(history)
+    x = np.arange(-history + 1, 1)
     zeros = [0.0] * history
-
-    (line_r,) = ax_rpy.plot(x, zeros, label="Roll")
-    (line_p,) = ax_rpy.plot(x, zeros, label="Pitch")
-    (line_y,) = ax_rpy.plot(x, zeros, label="Yaw")
-    ax_rpy.set_ylabel("Degrees")
-    ax_rpy.set_ylim(-360, 360)
-    ax_rpy.legend(loc="upper left")
-    ax_rpy.grid(True, alpha=0.3)
 
     (line_ax,) = ax_acc.plot(x, zeros, label="Acc X")
     (line_ay,) = ax_acc.plot(x, zeros, label="Acc Y")
     (line_az,) = ax_acc.plot(x, zeros, label="Acc Z")
+    ax_acc.set_title("Accel Data")
     ax_acc.set_ylabel("g")
     ax_acc.set_ylim(-8, 8)
     ax_acc.legend(loc="upper left")
     ax_acc.grid(True, alpha=0.3)
 
+    (line_gx,) = ax_gyro.plot(x, zeros, label="Gyro X")
+    (line_gy,) = ax_gyro.plot(x, zeros, label="Gyro Y")
+    (line_gz,) = ax_gyro.plot(x, zeros, label="Gyro Z")
+    ax_gyro.set_title("Gyro Data")
+    ax_gyro.set_ylabel("Gyro")
+    ax_gyro.set_ylim(-2000, 2000)
+    ax_gyro.legend(loc="upper left")
+    ax_gyro.grid(True, alpha=0.3)
+
+    (line_r,) = ax_rpy.plot(x, zeros, label="Roll")
+    (line_p,) = ax_rpy.plot(x, zeros, label="Pitch")
+    (line_y,) = ax_rpy.plot(x, zeros, label="Yaw")
+    ax_rpy.set_title("RPY Data")
+    ax_rpy.set_xlabel("Samples")
+    ax_rpy.set_ylabel("Degrees")
+    ax_rpy.set_ylim(-200, 200)
+    ax_rpy.legend(loc="upper left")
+    ax_rpy.grid(True, alpha=0.3)
+
+    (line_ax_freq,) = ax_acc_freq.plot([], [], label="Acc X")
+    (line_ay_freq,) = ax_acc_freq.plot([], [], label="Acc Y")
+    (line_az_freq,) = ax_acc_freq.plot([], [], label="Acc Z")
+    ax_acc_freq.set_title("Accel Data Frequency Analysis")
+    ax_acc_freq.set_ylabel("Magnitude")
+    ax_acc_freq.legend(loc="upper right")
+    ax_acc_freq.grid(True, alpha=0.3)
+
+    (line_gx_freq,) = ax_gyro_freq.plot([], [], label="Gyro X")
+    (line_gy_freq,) = ax_gyro_freq.plot([], [], label="Gyro Y")
+    (line_gz_freq,) = ax_gyro_freq.plot([], [], label="Gyro Z")
+    ax_gyro_freq.set_title("Gyro Data Frequency Analysis")
+    ax_gyro_freq.set_ylabel("Magnitude")
+    ax_gyro_freq.legend(loc="upper right")
+    ax_gyro_freq.grid(True, alpha=0.3)
+
+    (line_r_freq,) = ax_rpy_freq.plot([], [], label="Roll")
+    (line_p_freq,) = ax_rpy_freq.plot([], [], label="Pitch")
+    (line_y_freq,) = ax_rpy_freq.plot([], [], label="Yaw")
+    ax_rpy_freq.set_title("RPY Data Frequency Analysis")
+    ax_rpy_freq.set_xlabel("Frequency (Hz)")
+    ax_rpy_freq.set_ylabel("Magnitude")
+    ax_rpy_freq.legend(loc="upper right")
+    ax_rpy_freq.grid(True, alpha=0.3)
+
     def _pad(values: deque[float]) -> list[float]:
         padded = list(values)
         return [0.0] * (history - len(padded)) + padded
+
+    def _frequency_data(values: deque[float]) -> tuple[np.ndarray, np.ndarray]:
+        sample_count = min(len(values), len(timestamp_hist))
+        if sample_count < 2:
+            return np.array([]), np.array([])
+
+        samples = np.asarray(list(values)[-sample_count:], dtype=float)
+        timestamps = np.asarray(list(timestamp_hist)[-sample_count:], dtype=float)
+        sample_periods = np.diff(timestamps)
+        sample_periods = sample_periods[sample_periods > 0.0]
+        if sample_periods.size == 0:
+            return np.array([]), np.array([])
+
+        sample_period = float(np.median(sample_periods))
+        if not np.isfinite(sample_period) or sample_period <= 0.0:
+            return np.array([]), np.array([])
+
+        centered = samples - np.mean(samples)
+        if sample_count > 2:
+            centered = centered * np.hanning(sample_count)
+
+        magnitudes = np.abs(np.fft.rfft(centered)) / sample_count
+        if magnitudes.size > 2:
+            magnitudes[1:-1] *= 2.0
+        frequencies = np.fft.rfftfreq(sample_count, d=sample_period)
+        return frequencies, magnitudes
+
+    def _update_frequency_axis(
+        axis: Axes,
+        lines: tuple[Line2D, Line2D, Line2D],
+        values: tuple[deque[float], deque[float], deque[float]],
+    ) -> None:
+        max_frequency = 0.0
+        has_data = False
+        for line, hist in zip(lines, values):
+            frequencies, magnitudes = _frequency_data(hist)
+            line.set_data(frequencies, magnitudes)
+            if frequencies.size > 0:
+                max_frequency = max(max_frequency, float(frequencies[-1]))
+                has_data = True
+
+        if has_data:
+            axis.set_xlim(0.0, max_frequency)
+            axis.relim()
+            axis.autoscale_view(scalex=False, scaley=True)
 
     def update(_frame: int) -> tuple[Artist, ...]:
         latest_timestamp: float | None = None
         for sample in poller.drain():
             imu = sample.values
+            timestamp_hist.append(sample.timestamp)
             roll_hist.append(imu.roll * rad2deg)
             pitch_hist.append(imu.pitch * rad2deg)
             yaw_hist.append(imu.yaw * rad2deg)
             ax_hist.append(imu.acc_x)
             ay_hist.append(imu.acc_y)
             az_hist.append(imu.acc_z)
+            gx_hist.append(imu.gyro_x)
+            gy_hist.append(imu.gyro_y)
+            gz_hist.append(imu.gyro_z)
             latest_timestamp = sample.timestamp
 
-        line_r.set_ydata(_pad(roll_hist))
-        line_p.set_ydata(_pad(pitch_hist))
-        line_y.set_ydata(_pad(yaw_hist))
         line_ax.set_ydata(_pad(ax_hist))
         line_ay.set_ydata(_pad(ay_hist))
         line_az.set_ydata(_pad(az_hist))
+        line_gx.set_ydata(_pad(gx_hist))
+        line_gy.set_ydata(_pad(gy_hist))
+        line_gz.set_ydata(_pad(gz_hist))
+        line_r.set_ydata(_pad(roll_hist))
+        line_p.set_ydata(_pad(pitch_hist))
+        line_y.set_ydata(_pad(yaw_hist))
+
+        _update_frequency_axis(
+            ax_acc_freq,
+            (line_ax_freq, line_ay_freq, line_az_freq),
+            (ax_hist, ay_hist, az_hist),
+        )
+        _update_frequency_axis(
+            ax_gyro_freq,
+            (line_gx_freq, line_gy_freq, line_gz_freq),
+            (gx_hist, gy_hist, gz_hist),
+        )
+        _update_frequency_axis(
+            ax_rpy_freq,
+            (line_r_freq, line_p_freq, line_y_freq),
+            (roll_hist, pitch_hist, yaw_hist),
+        )
 
         if latest_timestamp is not None:
             status.set_text(f"Last sample: {time.monotonic() - latest_timestamp:.2f}s ago")
         elif poller.last_error is not None:
             status.set_text(f"IMU read error: {poller.last_error}")
 
-        return (line_r, line_p, line_y, line_ax, line_ay, line_az, status)
+        return (
+            line_ax,
+            line_ay,
+            line_az,
+            line_gx,
+            line_gy,
+            line_gz,
+            line_r,
+            line_p,
+            line_y,
+            line_ax_freq,
+            line_ay_freq,
+            line_az_freq,
+            line_gx_freq,
+            line_gy_freq,
+            line_gz_freq,
+            line_r_freq,
+            line_p_freq,
+            line_y_freq,
+            status,
+        )
 
     interval_ms = 1000.0 / refresh_hz
     _anim = FuncAnimation(
         fig, update, interval=interval_ms, blit=False, cache_frame_data=False
     )
-    plt.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.03, 1.0, 0.96))
     plt.show()
 
 
@@ -317,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=lambda value: int(value, 0),
         default=DEFAULT_MASK,
         metavar="MASK",
-        help="IMU field bitmask (default: 0x003f = RPY + accelerometer).",
+        help="IMU field bitmask (default: 0x01ff = RPY + accelerometer + gyroscope).",
     )
     return parser
 
