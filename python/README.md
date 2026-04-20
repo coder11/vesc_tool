@@ -95,9 +95,9 @@ python examples/imu_live_plot.py --tcp 192.168.1.100:65102
 python examples/imu_live_plot.py --scan-udp
 ```
 
-The live plot uses the VESC Tool `--tcpServer` bridge by default at
+The PyQtGraph live plot uses the VESC Tool `--tcpServer` bridge by default at
 `127.0.0.1:65102`. The `--mask` flag controls which IMU fields are requested
-(default `0x003f` = roll/pitch/yaw + accelerometer).
+(default `0x01ff` = roll/pitch/yaw + accelerometer + gyroscope).
 
 ## Project structure
 
@@ -120,7 +120,7 @@ python/
     client.py              # VescClient with serial/TCP transports
   tests/                   # unit tests (pytest, no hardware required)
   examples/
-    imu_live_plot.py       # matplotlib live IMU plot
+    imu_live_plot.py       # PyQtGraph live IMU plot
 ```
 
 ## Protocol notes

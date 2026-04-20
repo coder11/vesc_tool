@@ -13,7 +13,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import math
+import os
 import queue
 import sys
 import threading
@@ -21,28 +23,9 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
-import matplotlib
-
-# Agg is the default in many headless setups; FuncAnimation + plt.show() needs a GUI backend.
-if sys.platform == "darwin":
-    _GUI_BACKENDS = ("MacOSX", "TkAgg", "QtAgg", "Qt5Agg")
-else:
-    _GUI_BACKENDS = ("TkAgg", "QtAgg", "Qt5Agg")
-
-for _name in _GUI_BACKENDS:
-    try:
-        matplotlib.use(_name, force=True)
-        break
-    except (ImportError, ValueError):
-        continue
-
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
-from matplotlib.axes import Axes
-from matplotlib.artist import Artist
-from matplotlib.lines import Line2D
 
 from vesc_py import ImuValues, VescClient, udp_scan
 
@@ -51,6 +34,7 @@ DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_POLL_HZ = 50.0
 DEFAULT_REFRESH_HZ = 30.0
 DEFAULT_SPECTRUM_REFRESH_HZ = 2.0
+QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
 
 
 @dataclass(frozen=True)
@@ -171,13 +155,48 @@ def tcp_server_help(endpoint: str, port: int) -> str:
     )
 
 
-def require_interactive_backend() -> None:
-    """Fail early when Matplotlib selected a non-interactive backend."""
-    if matplotlib.get_backend().lower() == "agg":
+def import_pyqtgraph() -> tuple[Any, Any]:
+    """Import PyQtGraph lazily so non-plot commands do not require Qt."""
+    if (
+        sys.platform.startswith("linux")
+        and "QT_QPA_PLATFORM" not in os.environ
+        and "DISPLAY" in os.environ
+    ):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+    try:
+        import pyqtgraph as pg  # type: ignore[import-untyped]
+        from pyqtgraph.Qt import QtCore  # type: ignore[import-untyped]
+    except ImportError as exc:
         raise RuntimeError(
-            "No interactive matplotlib backend is available (still using Agg). "
-            "Install a GUI toolkit (e.g. python3-tk / tkinter, or PyQt5/PyQt6), "
-            "ensure DISPLAY is set for X11/Wayland, and unset MPLBACKEND if it forces Agg."
+            "PyQtGraph live plotting requires pyqtgraph and a Qt binding. "
+            "Install the project dependencies, or install them directly with "
+            "`python -m pip install pyqtgraph PySide6`."
+        ) from exc
+
+    return pg, QtCore
+
+
+def require_qt_platform_runtime() -> None:
+    """Fail before QApplication aborts when XCB runtime libraries are missing."""
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("QT_QPA_PLATFORM") != "xcb":
+        return
+
+    missing: list[str] = []
+    for lib_name in QT_XCB_RUNTIME_LIBS:
+        try:
+            ctypes.CDLL(lib_name)
+        except OSError:
+            missing.append(lib_name)
+
+    if missing:
+        raise RuntimeError(
+            "Qt's xcb platform plugin is missing runtime libraries: "
+            f"{', '.join(missing)}. Run this from the python Nix dev shell "
+            "(`nix develop .#python`), or install the matching system packages "
+            "(for example libxcb-cursor0 and libxcb-icccm4 on Debian/Ubuntu)."
         )
 
 
@@ -189,8 +208,9 @@ def run_live_plot(
     show_freq: bool = False,
     spectrum_refresh_hz: float = DEFAULT_SPECTRUM_REFRESH_HZ,
 ) -> None:
-    """Run a matplotlib live plot of IMU data."""
-    require_interactive_backend()
+    """Run a PyQtGraph live plot of IMU data."""
+    pg, QtCore = import_pyqtgraph()
+    pg.setConfigOptions(antialias=True)
 
     rad2deg = 180.0 / math.pi
     timestamp_hist: deque[float] = deque(maxlen=history)
@@ -209,95 +229,131 @@ def run_live_plot(
     spectrum_period = 1.0 / spectrum_refresh_hz if spectrum_enabled else math.inf
     next_spectrum_update = 0.0
 
-    if show_freq:
-        fig, axes = plt.subplots(3, 2, figsize=(14, 9), sharex="col")
-        (ax_acc, ax_acc_freq), (ax_gyro, ax_gyro_freq), (ax_rpy, ax_rpy_freq) = axes
-    else:
-        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
-        ax_acc, ax_gyro, ax_rpy = np.asarray(axes).ravel()
-        ax_acc_freq = ax_gyro_freq = ax_rpy_freq = None
-
-    fig.suptitle("VESC IMU Live Data")
-    status = fig.text(
-        0.01,
-        0.01,
-        "Waiting for IMU data... | Sample: measuring | Plot: measuring",
-        fontsize=9,
-    )
-
     x = np.arange(-history + 1, 1)
-    zeros = [0.0] * history
+    zeros = np.zeros(history)
+    require_qt_platform_runtime()
+    app = pg.mkQApp("VESC IMU Live Data")
+    window = pg.GraphicsLayoutWidget(title="VESC IMU Live Data")
+    window.setWindowTitle("VESC IMU Live Data")
+    window.resize(1400 if show_freq else 1000, 900)
 
-    (line_ax,) = ax_acc.plot(x, zeros, label="Acc X")
-    (line_ay,) = ax_acc.plot(x, zeros, label="Acc Y")
-    (line_az,) = ax_acc.plot(x, zeros, label="Acc Z")
-    ax_acc.set_title("Accel Data")
-    ax_acc.set_ylabel("g")
-    ax_acc.set_ylim(-8, 8)
-    ax_acc.legend(loc="upper left")
-    ax_acc.grid(True, alpha=0.3)
+    column_count = 2 if show_freq else 1
+    title = pg.LabelItem("VESC IMU Live Data", size="14pt", bold=True)
+    window.addItem(title, row=0, col=0, colspan=column_count)
+    status = pg.LabelItem(
+        "Waiting for IMU data... | Sample: measuring | Plot: measuring",
+        justify="left",
+    )
+    window.addItem(status, row=4, col=0, colspan=column_count)
 
-    (line_gx,) = ax_gyro.plot(x, zeros, label="Gyro X")
-    (line_gy,) = ax_gyro.plot(x, zeros, label="Gyro Y")
-    (line_gz,) = ax_gyro.plot(x, zeros, label="Gyro Z")
-    ax_gyro.set_title("Gyro Data")
-    ax_gyro.set_ylabel("Gyro")
-    ax_gyro.set_ylim(-2000, 2000)
-    ax_gyro.legend(loc="upper left")
-    ax_gyro.grid(True, alpha=0.3)
+    def _make_plot(
+        row: int,
+        col: int,
+        title_text: str,
+        y_label: str,
+        *,
+        x_label: str | None = None,
+        y_range: tuple[float, float] | None = None,
+        x_range: tuple[float, float] | None = None,
+    ) -> Any:
+        plot = window.addPlot(row=row, col=col, title=title_text)
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.addLegend(offset=(10, 10))
+        plot.setLabel("left", y_label)
+        if x_label is not None:
+            plot.setLabel("bottom", x_label)
+        if y_range is not None:
+            plot.setYRange(*y_range, padding=0.0)
+        if x_range is not None:
+            plot.setXRange(*x_range, padding=0.0)
+        return plot
 
-    (line_r,) = ax_rpy.plot(x, zeros, label="Roll")
-    (line_p,) = ax_rpy.plot(x, zeros, label="Pitch")
-    (line_y,) = ax_rpy.plot(x, zeros, label="Yaw")
-    ax_rpy.set_title("RPY Data")
-    ax_rpy.set_xlabel("Samples")
-    ax_rpy.set_ylabel("Degrees")
-    ax_rpy.set_ylim(-200, 200)
-    ax_rpy.legend(loc="upper left")
-    ax_rpy.grid(True, alpha=0.3)
+    def _add_lines(
+        plot: Any,
+        names: tuple[str, str, str],
+        *,
+        initial_x: np.ndarray = x,
+        initial_y: np.ndarray = zeros,
+    ) -> tuple[Any, Any, Any]:
+        colors = ((230, 88, 85), (80, 190, 120), (85, 150, 245))
+        return tuple(
+            plot.plot(initial_x, initial_y, pen=pg.mkPen(color, width=1.5), name=name)
+            for name, color in zip(names, colors)
+        )
 
-    acc_freq_lines: tuple[Line2D, Line2D, Line2D] | None = None
-    gyro_freq_lines: tuple[Line2D, Line2D, Line2D] | None = None
-    rpy_freq_lines: tuple[Line2D, Line2D, Line2D] | None = None
-    frequency_artists: tuple[Artist, ...] = ()
+    ax_acc = _make_plot(
+        1,
+        0,
+        "Accel Data",
+        "g",
+        y_range=(-8, 8),
+        x_range=(-history + 1, 0),
+    )
+    line_ax, line_ay, line_az = _add_lines(ax_acc, ("Acc X", "Acc Y", "Acc Z"))
+
+    ax_gyro = _make_plot(
+        2,
+        0,
+        "Gyro Data",
+        "Gyro",
+        y_range=(-2000, 2000),
+        x_range=(-history + 1, 0),
+    )
+    line_gx, line_gy, line_gz = _add_lines(ax_gyro, ("Gyro X", "Gyro Y", "Gyro Z"))
+
+    ax_rpy = _make_plot(
+        3,
+        0,
+        "RPY Data",
+        "Degrees",
+        x_label="Samples",
+        y_range=(-200, 200),
+        x_range=(-history + 1, 0),
+    )
+    line_r, line_p, line_y = _add_lines(ax_rpy, ("Roll", "Pitch", "Yaw"))
+
+    acc_freq_lines: tuple[Any, Any, Any] | None = None
+    gyro_freq_lines: tuple[Any, Any, Any] | None = None
+    rpy_freq_lines: tuple[Any, Any, Any] | None = None
+    ax_acc_freq = ax_gyro_freq = ax_rpy_freq = None
+
     if show_freq:
-        assert ax_acc_freq is not None
-        assert ax_gyro_freq is not None
-        assert ax_rpy_freq is not None
+        empty = np.array([])
+        ax_acc_freq = _make_plot(1, 1, "Accel Data Frequency Analysis", "Magnitude")
+        acc_freq_lines = _add_lines(
+            ax_acc_freq,
+            ("Acc X", "Acc Y", "Acc Z"),
+            initial_x=empty,
+            initial_y=empty,
+        )
 
-        (line_ax_freq,) = ax_acc_freq.plot([], [], label="Acc X")
-        (line_ay_freq,) = ax_acc_freq.plot([], [], label="Acc Y")
-        (line_az_freq,) = ax_acc_freq.plot([], [], label="Acc Z")
-        ax_acc_freq.set_title("Accel Data Frequency Analysis")
-        ax_acc_freq.set_ylabel("Magnitude")
-        ax_acc_freq.legend(loc="upper right")
-        ax_acc_freq.grid(True, alpha=0.3)
-        acc_freq_lines = (line_ax_freq, line_ay_freq, line_az_freq)
+        ax_gyro_freq = _make_plot(2, 1, "Gyro Data Frequency Analysis", "Magnitude")
+        gyro_freq_lines = _add_lines(
+            ax_gyro_freq,
+            ("Gyro X", "Gyro Y", "Gyro Z"),
+            initial_x=empty,
+            initial_y=empty,
+        )
 
-        (line_gx_freq,) = ax_gyro_freq.plot([], [], label="Gyro X")
-        (line_gy_freq,) = ax_gyro_freq.plot([], [], label="Gyro Y")
-        (line_gz_freq,) = ax_gyro_freq.plot([], [], label="Gyro Z")
-        ax_gyro_freq.set_title("Gyro Data Frequency Analysis")
-        ax_gyro_freq.set_ylabel("Magnitude")
-        ax_gyro_freq.legend(loc="upper right")
-        ax_gyro_freq.grid(True, alpha=0.3)
-        gyro_freq_lines = (line_gx_freq, line_gy_freq, line_gz_freq)
+        ax_rpy_freq = _make_plot(
+            3,
+            1,
+            "RPY Data Frequency Analysis",
+            "Magnitude",
+            x_label="Frequency (Hz)",
+        )
+        rpy_freq_lines = _add_lines(
+            ax_rpy_freq,
+            ("Roll", "Pitch", "Yaw"),
+            initial_x=empty,
+            initial_y=empty,
+        )
 
-        (line_r_freq,) = ax_rpy_freq.plot([], [], label="Roll")
-        (line_p_freq,) = ax_rpy_freq.plot([], [], label="Pitch")
-        (line_y_freq,) = ax_rpy_freq.plot([], [], label="Yaw")
-        ax_rpy_freq.set_title("RPY Data Frequency Analysis")
-        ax_rpy_freq.set_xlabel("Frequency (Hz)")
-        ax_rpy_freq.set_ylabel("Magnitude")
-        ax_rpy_freq.legend(loc="upper right")
-        ax_rpy_freq.grid(True, alpha=0.3)
-        rpy_freq_lines = (line_r_freq, line_p_freq, line_y_freq)
-
-        frequency_artists = acc_freq_lines + gyro_freq_lines + rpy_freq_lines
-
-    def _pad(values: deque[float]) -> list[float]:
-        padded = list(values)
-        return [0.0] * (history - len(padded)) + padded
+    def _pad(values: deque[float]) -> np.ndarray:
+        padded = np.asarray(values, dtype=float)
+        if padded.size >= history:
+            return padded[-history:]
+        return np.concatenate((np.zeros(history - padded.size), padded))
 
     def _frequency_bins() -> tuple[int, np.ndarray, np.ndarray] | None:
         sample_count = len(timestamp_hist)
@@ -337,19 +393,21 @@ def run_live_plot(
         return magnitudes
 
     def _update_frequency_axis(
-        axis: Axes,
-        lines: tuple[Line2D, Line2D, Line2D],
+        axis: Any,
+        lines: tuple[Any, Any, Any],
         values: tuple[deque[float], deque[float], deque[float]],
         bins: tuple[int, np.ndarray, np.ndarray],
     ) -> None:
         sample_count, frequencies, window = bins
+        max_magnitude = 0.0
         for line, hist in zip(lines, values):
             magnitudes = _frequency_magnitudes(hist, sample_count, window)
-            line.set_data(frequencies, magnitudes)
+            if magnitudes.size > 0:
+                max_magnitude = max(max_magnitude, float(np.max(magnitudes)))
+            line.setData(frequencies, magnitudes)
 
-        axis.set_xlim(0.0, float(frequencies[-1]))
-        axis.relim()
-        axis.autoscale_view(scalex=False, scaley=True)
+        axis.setXRange(0.0, max(float(frequencies[-1]), 1.0), padding=0.0)
+        axis.setYRange(0.0, max(max_magnitude * 1.1, 1e-6), padding=0.0)
 
     def _actual_refresh_hz() -> float | None:
         if len(refresh_timestamp_hist) < 2:
@@ -371,7 +429,7 @@ def run_live_plot(
 
         return (len(timestamp_hist) - 1) / elapsed
 
-    def update(_frame: int) -> tuple[Artist, ...]:
+    def update() -> None:
         nonlocal last_sample_timestamp, next_spectrum_update
 
         now = time.monotonic()
@@ -393,15 +451,15 @@ def run_live_plot(
             last_sample_timestamp = sample.timestamp
 
         if samples:
-            line_ax.set_ydata(_pad(ax_hist))
-            line_ay.set_ydata(_pad(ay_hist))
-            line_az.set_ydata(_pad(az_hist))
-            line_gx.set_ydata(_pad(gx_hist))
-            line_gy.set_ydata(_pad(gy_hist))
-            line_gz.set_ydata(_pad(gz_hist))
-            line_r.set_ydata(_pad(roll_hist))
-            line_p.set_ydata(_pad(pitch_hist))
-            line_y.set_ydata(_pad(yaw_hist))
+            line_ax.setData(x, _pad(ax_hist))
+            line_ay.setData(x, _pad(ay_hist))
+            line_az.setData(x, _pad(az_hist))
+            line_gx.setData(x, _pad(gx_hist))
+            line_gy.setData(x, _pad(gy_hist))
+            line_gz.setData(x, _pad(gz_hist))
+            line_r.setData(x, _pad(roll_hist))
+            line_p.setData(x, _pad(pitch_hist))
+            line_y.setData(x, _pad(yaw_hist))
 
             if spectrum_enabled and now >= next_spectrum_update:
                 bins = _frequency_bins()
@@ -451,28 +509,23 @@ def run_live_plot(
                 )
         else:
             sample_text = "Waiting for IMU data..."
-        status.set_text(f"{sample_text} | {plot_text}")
+        status.setText(f"{sample_text} | {plot_text}")
 
-        return (
-            line_ax,
-            line_ay,
-            line_az,
-            line_gx,
-            line_gy,
-            line_gz,
-            line_r,
-            line_p,
-            line_y,
-            *frequency_artists,
-            status,
-        )
+    timer = QtCore.QTimer()
+    timer.setInterval(max(1, round(1000.0 / refresh_hz)))
+    timer.timeout.connect(update)
 
-    interval_ms = 1000.0 / refresh_hz
-    _anim = FuncAnimation(
-        fig, update, interval=interval_ms, blit=False, cache_frame_data=False
-    )
-    fig.tight_layout(rect=(0.0, 0.03, 1.0, 0.96))
-    plt.show()
+    def stop_timer(*_args: object) -> None:
+        timer.stop()
+
+    window.destroyed.connect(stop_timer)
+    update()
+    window.show()
+    timer.start()
+    exec_app = getattr(app, "exec", None)
+    if exec_app is None:
+        exec_app = app.exec_
+    exec_app()
 
 
 def build_parser() -> argparse.ArgumentParser:

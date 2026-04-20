@@ -9,28 +9,44 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          # Stdlib tkinter + _tkinter; system/uv Pythons often omit it. Matplotlib TkAgg needs this.
-          pythonWithTk = pkgs.python313.withPackages (ps: [ ps.tkinter ]);
-          # PyPI wheels (numpy, matplotlib, …) link libstdc++; NixOS has no default FHS path.
-          # Tk (Tcl/Tk) so matplotlib's TkAgg backend can dlopen libtk; avoids Agg + no window.
+          python = pkgs.python313;
+          # PyPI wheels (numpy, PySide6, ...) link system libraries; NixOS has no default FHS path.
           linuxPyPiLdPath = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [
+              pkgs.fontconfig
+              pkgs.freetype
+              pkgs.dbus
+              pkgs.glib
+              pkgs.libglvnd
+              pkgs.libxkbcommon
+              pkgs.libxcb
+              pkgs.libxcb-cursor
+              pkgs.libxcb-image
+              pkgs.libxcb-keysyms
+              pkgs.libxcb-render-util
+              pkgs.libxcb-util
+              pkgs.xcbutilwm
               pkgs.stdenv.cc.cc.lib
-              pkgs.tk
+              pkgs.libice
+              pkgs.libsm
+              pkgs.libx11
+              pkgs.libxext
+              pkgs.libxi
+              pkgs.libxrender
+              pkgs.wayland
+              pkgs.zlib
+              pkgs.zstd
             ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export MPLBACKEND=TkAgg
           '';
           pyShell = pkgs.mkShell {
-            packages = [ pkgs.uv pythonWithTk ];
+            packages = [ pkgs.uv python ];
             shellHook = linuxPyPiLdPath + ''
-              export UV_PYTHON="${pythonWithTk}/bin/python3"
-              # Nix puts _tkinter in the wrapped interpreter's site-packages; uv's venv hides it unless
-              # include-system-site-packages is true. Recreate .venv when it's missing or isolated.
+              export UV_PYTHON="${python}/bin/python3"
               # Run `nix develop` from this directory (same folder as pyproject.toml), not via `cd` into the flake store path.
-              if [[ -f pyproject.toml ]] && { [[ ! -d .venv ]] || ! grep -q '^include-system-site-packages = true' .venv/pyvenv.cfg 2>/dev/null; }; then
-                echo "vesc-py dev shell: creating .venv with --system-site-packages (tkinter for matplotlib)."
+              if [[ -f pyproject.toml ]] && [[ ! -d .venv ]]; then
+                echo "vesc-py dev shell: creating .venv."
                 rm -rf .venv
-                uv venv --system-site-packages
+                uv venv
                 uv sync
               fi
             '';
