@@ -289,7 +289,7 @@ def tcp_server_help(endpoint: str, port: int) -> str:
     )
 
 
-def import_pyqtgraph() -> tuple[Any, Any]:
+def import_pyqtgraph() -> tuple[Any, Any, Any]:
     """Import PyQtGraph lazily so non-plot commands do not require Qt."""
     if (
         sys.platform.startswith("linux")
@@ -301,6 +301,7 @@ def import_pyqtgraph() -> tuple[Any, Any]:
     try:
         import pyqtgraph as pg  # type: ignore[import-untyped]
         from pyqtgraph.Qt import QtCore  # type: ignore[import-untyped]
+        from pyqtgraph.Qt import QtWidgets  # type: ignore[import-untyped]
     except ImportError as exc:
         raise RuntimeError(
             "PyQtGraph live plotting requires pyqtgraph and a Qt binding. "
@@ -308,7 +309,7 @@ def import_pyqtgraph() -> tuple[Any, Any]:
             "`python -m pip install pyqtgraph PySide6`."
         ) from exc
 
-    return pg, QtCore
+    return pg, QtCore, QtWidgets
 
 
 def require_qt_platform_runtime() -> None:
@@ -343,7 +344,7 @@ def run_live_plot(
     antialias: bool = False,
 ) -> None:
     """Run a PyQtGraph live plot of IMU data."""
-    pg, QtCore = import_pyqtgraph()
+    pg, QtCore, QtWidgets = import_pyqtgraph()
     pg.setConfigOptions(antialias=antialias)
 
     rad2deg = 180.0 / math.pi
@@ -359,18 +360,29 @@ def run_live_plot(
     zeros = np.zeros(history)
     require_qt_platform_runtime()
     app = pg.mkQApp("VESC IMU Live Data")
-    window = pg.GraphicsLayoutWidget(title="VESC IMU Live Data")
+    window = QtWidgets.QWidget()
     window.setWindowTitle("VESC IMU Live Data")
     window.resize(1400 if show_freq else 1000, 900)
 
     column_count = 2 if show_freq else 1
-    title = pg.LabelItem("VESC IMU Live Data", size="14pt", bold=True)
-    window.addItem(title, row=0, col=0, colspan=column_count)
-    status = pg.LabelItem(
-        "Waiting for IMU data... | Sample: measuring | Plot: measuring",
-        justify="left",
-    )
-    window.addItem(status, row=4, col=0, colspan=column_count)
+    qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
+    title = QtWidgets.QLabel("VESC IMU Live Data")
+    title.setAlignment(qt_alignment.AlignCenter)
+    title.setStyleSheet("font-size: 14pt; font-weight: 700; color: #999999;")
+    status = QtWidgets.QLabel("Waiting for IMU data... | Sample: measuring | Plot: measuring")
+    status.setStyleSheet("color: #999999;")
+
+    layout = QtWidgets.QGridLayout(window)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    layout.addWidget(title, 0, 0, 1, column_count)
+    layout.addWidget(status, 4, 0, 1, column_count)
+    for plot_row in (1, 2, 3):
+        layout.setRowStretch(plot_row, 1)
+    for plot_col in range(column_count):
+        layout.setColumnStretch(plot_col, 1)
+    window.setStyleSheet("background-color: #000000;")
+    qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
 
     def _make_plot(
         row: int,
@@ -382,10 +394,19 @@ def run_live_plot(
         y_range: tuple[float, float] | None = None,
         x_range: tuple[float, float] | None = None,
     ) -> Any:
-        plot = window.addPlot(row=row, col=col, title=title_text)
+        plot_widget = pg.PlotWidget(title=title_text)
+        plot_widget.setMinimumSize(0, 0)
+        plot_widget.setSizePolicy(
+            qt_size_policy.Ignored,
+            qt_size_policy.Ignored,
+        )
+        layout.addWidget(plot_widget, row, col)
+        plot = plot_widget.getPlotItem()
         plot.showGrid(x=True, y=True, alpha=0.3)
         plot.addLegend(offset=(10, 10))
         plot.setLabel("left", y_label)
+        plot.getAxis("left").setWidth(56)
+        plot.getAxis("bottom").setHeight(36)
         if x_label is not None:
             plot.setLabel("bottom", x_label)
         if y_range is not None:
