@@ -113,7 +113,9 @@ gyro offsets, accelerometer offsets, and orientation calibration. Use
 `--skip-basic`, `--skip-gyro`, `--skip-accel`, or `--skip-orientation` to run
 only part of the flow. In interactive mode the gyro, accelerometer, and
 orientation steps keep sampling until you press `s`/Enter to save, `r` to retry,
-`k` to skip, or `c` to cancel.
+`k` to skip, or `c` to cancel. Calibration readouts and saved calibration values
+use a 3 second rolling mean by default; pass `--mean-seconds 0` to disable it or
+another value to tune the window.
 
 ## Project structure
 

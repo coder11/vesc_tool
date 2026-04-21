@@ -7,6 +7,8 @@ from vesc_py.imu_setup import (
     AxisTriple,
     FilteredImuState,
     ImuBasicProfile,
+    RollingMeanImuState,
+    RollingMeanValue,
     YawOffsetEstimator,
     apply_basic_profile,
     apply_pitch_offset,
@@ -94,6 +96,74 @@ def test_filtered_imu_state_matches_wizard_low_pass_update() -> None:
     assert state.gyro_z == pytest.approx(3.0)
     assert state.max_acc_x == pytest.approx(0.2)
     assert state.working_imu
+
+
+def test_rolling_mean_imu_state_tracks_recent_window_and_peak_mean_accel() -> None:
+    mean = RollingMeanImuState(3.0)
+
+    first = mean.update(
+        0.0,
+        FilteredImuState(
+            roll=1.0,
+            pitch=2.0,
+            yaw=3.0,
+            acc_x=0.2,
+            acc_y=0.3,
+            acc_z=0.4,
+            gyro_x=10.0,
+            gyro_y=20.0,
+            gyro_z=30.0,
+        ),
+    )
+    assert first.gyro_x == pytest.approx(10.0)
+    assert first.max_acc_x == pytest.approx(0.2)
+
+    second = mean.update(
+        1.0,
+        FilteredImuState(
+            roll=3.0,
+            pitch=4.0,
+            yaw=5.0,
+            acc_x=0.6,
+            acc_y=0.7,
+            acc_z=0.8,
+            gyro_x=14.0,
+            gyro_y=24.0,
+            gyro_z=34.0,
+        ),
+    )
+    assert second.roll == pytest.approx(2.0)
+    assert second.acc_x == pytest.approx(0.4)
+    assert second.gyro_z == pytest.approx(32.0)
+    assert second.max_acc_x == pytest.approx(0.4)
+
+    third = mean.update(
+        4.5,
+        FilteredImuState(
+            roll=5.0,
+            pitch=6.0,
+            yaw=7.0,
+            acc_x=0.1,
+            acc_y=0.2,
+            acc_z=0.3,
+            gyro_x=18.0,
+            gyro_y=28.0,
+            gyro_z=38.0,
+        ),
+    )
+    assert mean.sample_count == 1
+    assert third.roll == pytest.approx(5.0)
+    assert third.acc_x == pytest.approx(0.1)
+    assert third.max_acc_x == pytest.approx(0.4)
+
+
+def test_rolling_mean_value_tracks_recent_window() -> None:
+    mean = RollingMeanValue(3.0)
+
+    assert mean.update(0.0, 10.0) == pytest.approx(10.0)
+    assert mean.update(1.0, 14.0) == pytest.approx(12.0)
+    assert mean.update(4.5, 18.0) == pytest.approx(18.0)
+    assert mean.sample_count == 1
 
 
 def test_save_gyro_and_accel_offsets_match_qml_formulas() -> None:

@@ -7,6 +7,8 @@ IMU setup wizard while keeping hardware prompting in examples.
 from __future__ import annotations
 
 import math
+from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import MutableMapping, SupportsFloat, SupportsInt, cast
@@ -97,6 +99,132 @@ class FilteredImuState:
         """Return the wizard's simple gyro-noise based IMU working check."""
 
         return self.gyro_x_noise >= 0.01
+
+
+def _mean(values: Iterable[float]) -> float:
+    total = 0.0
+    count = 0
+    for value in values:
+        total += value
+        count += 1
+    return total / count if count else 0.0
+
+
+def copy_filtered_imu_state(state: FilteredImuState) -> FilteredImuState:
+    """Return a copy of a filtered IMU state."""
+
+    return FilteredImuState(
+        roll=state.roll,
+        pitch=state.pitch,
+        yaw=state.yaw,
+        acc_x=state.acc_x,
+        acc_y=state.acc_y,
+        acc_z=state.acc_z,
+        gyro_x=state.gyro_x,
+        gyro_y=state.gyro_y,
+        gyro_z=state.gyro_z,
+        gyro_x_noise=state.gyro_x_noise,
+        gyro_x_previous=state.gyro_x_previous,
+        max_acc_x=state.max_acc_x,
+        max_acc_y=state.max_acc_y,
+        max_acc_z=state.max_acc_z,
+    )
+
+
+class RollingMeanImuState:
+    """Rolling mean of filtered IMU states over a time window."""
+
+    def __init__(self, window_seconds: float) -> None:
+        if window_seconds <= 0.0:
+            raise ValueError("window_seconds must be greater than 0")
+        self._window_seconds = window_seconds
+        self._samples: deque[tuple[float, FilteredImuState]] = deque()
+        self._max_mean_acc_x = -10.0
+        self._max_mean_acc_y = -10.0
+        self._max_mean_acc_z = -10.0
+
+    @property
+    def sample_count(self) -> int:
+        """Number of samples currently in the rolling window."""
+
+        return len(self._samples)
+
+    def update(self, timestamp: float, state: FilteredImuState) -> FilteredImuState:
+        """Add a sample and return the current rolling mean state."""
+
+        self._samples.append((timestamp, copy_filtered_imu_state(state)))
+        self._drop_old_samples(timestamp)
+        mean_state = self.mean_state()
+        self._max_mean_acc_x = max(self._max_mean_acc_x, mean_state.acc_x)
+        self._max_mean_acc_y = max(self._max_mean_acc_y, mean_state.acc_y)
+        self._max_mean_acc_z = max(self._max_mean_acc_z, mean_state.acc_z)
+        mean_state.max_acc_x = self._max_mean_acc_x
+        mean_state.max_acc_y = self._max_mean_acc_y
+        mean_state.max_acc_z = self._max_mean_acc_z
+        return mean_state
+
+    def mean_state(self) -> FilteredImuState:
+        """Return the mean of the samples in the current window."""
+
+        states = [state for _, state in self._samples]
+        if not states:
+            return FilteredImuState()
+
+        return FilteredImuState(
+            roll=_mean(state.roll for state in states),
+            pitch=_mean(state.pitch for state in states),
+            yaw=_mean(state.yaw for state in states),
+            acc_x=_mean(state.acc_x for state in states),
+            acc_y=_mean(state.acc_y for state in states),
+            acc_z=_mean(state.acc_z for state in states),
+            gyro_x=_mean(state.gyro_x for state in states),
+            gyro_y=_mean(state.gyro_y for state in states),
+            gyro_z=_mean(state.gyro_z for state in states),
+            gyro_x_noise=_mean(state.gyro_x_noise for state in states),
+            gyro_x_previous=states[-1].gyro_x_previous,
+            max_acc_x=self._max_mean_acc_x,
+            max_acc_y=self._max_mean_acc_y,
+            max_acc_z=self._max_mean_acc_z,
+        )
+
+    def _drop_old_samples(self, timestamp: float) -> None:
+        cutoff = timestamp - self._window_seconds
+        while len(self._samples) > 1 and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+
+class RollingMeanValue:
+    """Rolling mean for a scalar value over a time window."""
+
+    def __init__(self, window_seconds: float) -> None:
+        if window_seconds <= 0.0:
+            raise ValueError("window_seconds must be greater than 0")
+        self._window_seconds = window_seconds
+        self._samples: deque[tuple[float, float]] = deque()
+
+    @property
+    def value(self) -> float:
+        """Mean value of the current samples."""
+
+        return _mean(value for _, value in self._samples)
+
+    @property
+    def sample_count(self) -> int:
+        """Number of samples currently in the rolling window."""
+
+        return len(self._samples)
+
+    def update(self, timestamp: float, value: float) -> float:
+        """Add a sample and return the current rolling mean."""
+
+        self._samples.append((timestamp, value))
+        self._drop_old_samples(timestamp)
+        return self.value
+
+    def _drop_old_samples(self, timestamp: float) -> None:
+        cutoff = timestamp - self._window_seconds
+        while len(self._samples) > 1 and self._samples[0][0] < cutoff:
+            self._samples.popleft()
 
 
 @dataclass

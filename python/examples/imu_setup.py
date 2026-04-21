@@ -29,6 +29,8 @@ from vesc_py.imu_setup import (
     IMU_SETUP_MASK,
     FilteredImuState,
     ImuBasicProfile,
+    RollingMeanImuState,
+    RollingMeanValue,
     YawOffsetEstimator,
     apply_basic_profile,
     apply_pitch_offset,
@@ -47,11 +49,13 @@ DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
 DEFAULT_POLL_HZ = 50.0
 DEFAULT_SAMPLE_SECONDS = 5.0
 DEFAULT_SEARCH_SECONDS = 2.0
+DEFAULT_MEAN_SECONDS = 3.0
 RAD_TO_DEG = 180.0 / 3.141592653589793
 DEG_TO_RAD = 3.141592653589793 / 180.0
 ProfileChoice = Literal["current", "default", "logs", "balance-unicycle", "balance-skateboard"]
 StepChoice = Literal["save", "retry", "skip", "cancel"]
 STEP_PROMPT = "s/Enter=save  r=retry  k=skip  c=cancel"
+PostUpdateCallback = Callable[[float, FilteredImuState], None]
 
 
 @dataclass(frozen=True)
@@ -224,10 +228,15 @@ def sample_filtered_imu(
     poll_hz: float,
     status: Callable[[FilteredImuState], str] | None = None,
     yaw_estimator: YawOffsetEstimator | None = None,
+    mean_seconds: float = 0.0,
+    post_update: PostUpdateCallback | None = None,
 ) -> FilteredImuState:
     """Poll and filter IMU data for a fixed duration."""
+    # pylint: disable=too-many-locals
 
     state = FilteredImuState()
+    mean_window = RollingMeanImuState(mean_seconds) if mean_seconds > 0.0 else None
+    display_state = state
     period = 1.0 / poll_hz
     end_time = time.monotonic() + seconds
     next_poll = time.monotonic()
@@ -240,8 +249,11 @@ def sample_filtered_imu(
             yaw_estimator.update(values)
 
         now = time.monotonic()
+        if post_update is not None:
+            post_update(now, state)
+        display_state = mean_window.update(now, state) if mean_window is not None else state
         if status is not None and now >= next_status:
-            print(f"\r{status(state)}", end="", flush=True)
+            print(f"\r{status(display_state)}", end="", flush=True)
             next_status = now + 0.25
 
         next_poll += period
@@ -253,7 +265,7 @@ def sample_filtered_imu(
 
     if status is not None:
         print()
-    return state
+    return display_state
 
 
 def sample_filtered_imu_until_step_choice(
@@ -262,6 +274,8 @@ def sample_filtered_imu_until_step_choice(
     poll_hz: float,
     status: Callable[[FilteredImuState], str],
     yaw_estimator: YawOffsetEstimator | None = None,
+    mean_seconds: float = 0.0,
+    post_update: PostUpdateCallback | None = None,
 ) -> tuple[FilteredImuState, StepChoice]:
     """Poll IMU data until the user chooses a calibration-step action."""
     # pylint: disable=too-many-locals
@@ -273,10 +287,14 @@ def sample_filtered_imu_until_step_choice(
             poll_hz=poll_hz,
             status=status,
             yaw_estimator=yaw_estimator,
+            mean_seconds=mean_seconds,
+            post_update=post_update,
         )
         return state, prompt_step()
 
     state = FilteredImuState()
+    mean_window = RollingMeanImuState(mean_seconds) if mean_seconds > 0.0 else None
+    display_state = state
     period = 1.0 / poll_hz
     next_poll = time.monotonic()
     next_status = 0.0
@@ -286,12 +304,13 @@ def sample_filtered_imu_until_step_choice(
 
     def render_status() -> None:
         nonlocal last_line_len
-        line = f"{status(state)} | {STEP_PROMPT}"
+        line = f"{status(display_state)} | {STEP_PROMPT}"
         padding = " " * max(0, last_line_len - len(line))
         print(f"\r{line}{padding}", end="", flush=True)
         last_line_len = len(line)
 
-    print(f"Sampling until action ({STEP_PROMPT})")
+    mean_note = f"{mean_seconds:g}s rolling mean" if mean_seconds > 0.0 else "instant value"
+    print(f"Sampling {mean_note} until action ({STEP_PROMPT})")
     try:
         tty.setcbreak(fd)
         while True:
@@ -301,6 +320,9 @@ def sample_filtered_imu_until_step_choice(
                 yaw_estimator.update(values)
 
             now = time.monotonic()
+            if post_update is not None:
+                post_update(now, state)
+            display_state = mean_window.update(now, state) if mean_window is not None else state
             if now >= next_status:
                 render_status()
                 next_status = now + 0.25
@@ -311,7 +333,7 @@ def sample_filtered_imu_until_step_choice(
                 choice = parse_step_choice(char, default="save")
                 if choice is not None:
                     print()
-                    return state, choice
+                    return display_state, choice
                 print(f"\nUnknown action {char!r}. Use {STEP_PROMPT}.")
                 last_line_len = 0
                 render_status()
@@ -450,6 +472,7 @@ def run_gyro_step(
     assume_yes: bool,
     poll_hz: float,
     sample_seconds: float,
+    mean_seconds: float,
     wait_ack: bool,
 ) -> None:
     """Run the gyro-offset calibration step."""
@@ -471,6 +494,7 @@ def run_gyro_step(
                 seconds=sample_seconds,
                 poll_hz=poll_hz,
                 status=gyro_status,
+                mean_seconds=mean_seconds,
             )
             choice: StepChoice = "save"
         else:
@@ -478,6 +502,7 @@ def run_gyro_step(
                 client,
                 poll_hz=poll_hz,
                 status=gyro_status,
+                mean_seconds=mean_seconds,
             )
         print(
             f"Measured gyro offsets: X {state.gyro_x:+.6f}, "
@@ -527,6 +552,7 @@ def run_accel_step(
     assume_yes: bool,
     poll_hz: float,
     sample_seconds: float,
+    mean_seconds: float,
     wait_ack: bool,
 ) -> None:
     """Run the accelerometer max-axis calibration step."""
@@ -551,6 +577,7 @@ def run_accel_step(
                     seconds=sample_seconds,
                     poll_hz=poll_hz,
                     status=status,
+                    mean_seconds=mean_seconds,
                 )
                 choice: StepChoice = "save"
             else:
@@ -558,6 +585,7 @@ def run_accel_step(
                     client,
                     poll_hz=poll_hz,
                     status=status,
+                    mean_seconds=mean_seconds,
                 )
             max_value = axis_max(state, axis)
             print(f"Measured max {axis.upper()}: {max_value:+.6f}")
@@ -612,6 +640,7 @@ def run_roll_orientation(
     assume_yes: bool,
     poll_hz: float,
     sample_seconds: float,
+    mean_seconds: float,
     wait_ack: bool,
 ) -> StepChoice:
     """Run the roll orientation sub-step."""
@@ -629,6 +658,7 @@ def run_roll_orientation(
                 seconds=sample_seconds,
                 poll_hz=poll_hz,
                 status=roll_status,
+                mean_seconds=mean_seconds,
             )
             choice: StepChoice = "save"
         else:
@@ -636,6 +666,7 @@ def run_roll_orientation(
                 client,
                 poll_hz=poll_hz,
                 status=roll_status,
+                mean_seconds=mean_seconds,
             )
         print(f"Measured roll offset: {(-state.roll * RAD_TO_DEG - restore.rot_roll):+.6f} deg")
         if choice == "save":
@@ -658,6 +689,7 @@ def run_pitch_orientation(
     assume_yes: bool,
     poll_hz: float,
     sample_seconds: float,
+    mean_seconds: float,
     wait_ack: bool,
 ) -> StepChoice:
     """Run the pitch orientation sub-step."""
@@ -677,6 +709,7 @@ def run_pitch_orientation(
                 seconds=sample_seconds,
                 poll_hz=poll_hz,
                 status=pitch_status,
+                mean_seconds=mean_seconds,
             )
             choice: StepChoice = "save"
         else:
@@ -684,6 +717,7 @@ def run_pitch_orientation(
                 client,
                 poll_hz=poll_hz,
                 status=pitch_status,
+                mean_seconds=mean_seconds,
             )
         print(
             f"Measured pitch offset: {(state.pitch * RAD_TO_DEG - restore.rot_pitch):+.6f} deg"
@@ -708,9 +742,11 @@ def run_yaw_orientation(
     assume_yes: bool,
     poll_hz: float,
     sample_seconds: float,
+    mean_seconds: float,
     wait_ack: bool,
 ) -> StepChoice:
     """Run the yaw orientation sub-step."""
+    # pylint: disable=too-many-locals
 
     while True:
         wait_for_enter(
@@ -718,9 +754,19 @@ def run_yaw_orientation(
             assume_yes=assume_yes,
         )
         estimator = YawOffsetEstimator()
+        yaw_mean = RollingMeanValue(mean_seconds) if mean_seconds > 0.0 else None
+
+        def record_yaw_offset(timestamp: float, _: FilteredImuState) -> None:
+            if yaw_mean is not None:
+                yaw_mean.update(timestamp, estimator.yaw_offset)
+
+        def current_yaw_offset() -> float:
+            if yaw_mean is not None and yaw_mean.sample_count > 0:
+                return yaw_mean.value
+            return estimator.yaw_offset
 
         def status(_: FilteredImuState) -> str:
-            yaw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
+            yaw_offset = -current_yaw_offset() * RAD_TO_DEG - restore.rot_yaw
             return f"Yaw offset {yaw_offset:+.3f} deg"
 
         if assume_yes:
@@ -730,6 +776,7 @@ def run_yaw_orientation(
                 poll_hz=poll_hz,
                 status=status,
                 yaw_estimator=estimator,
+                post_update=record_yaw_offset,
             )
             choice: StepChoice = "save"
         else:
@@ -738,11 +785,13 @@ def run_yaw_orientation(
                 poll_hz=poll_hz,
                 status=status,
                 yaw_estimator=estimator,
+                post_update=record_yaw_offset,
             )
-        yaw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
+        yaw_offset_raw = current_yaw_offset()
+        yaw_offset = -yaw_offset_raw * RAD_TO_DEG - restore.rot_yaw
         print(f"Measured yaw offset: {yaw_offset:+.6f} deg")
         if choice == "save":
-            apply_yaw_offset(config, -estimator.yaw_offset)
+            apply_yaw_offset(config, -yaw_offset_raw)
             write_appconf(client, config, store=True, wait_ack=wait_ack)
             return "save"
         if choice == "skip":
@@ -760,6 +809,7 @@ def run_orientation_step(
     assume_yes: bool,
     poll_hz: float,
     sample_seconds: float,
+    mean_seconds: float,
     wait_ack: bool,
 ) -> None:
     """Run the orientation calibration step."""
@@ -778,6 +828,7 @@ def run_orientation_step(
                 assume_yes=assume_yes,
                 poll_hz=poll_hz,
                 sample_seconds=sample_seconds,
+                mean_seconds=mean_seconds,
                 wait_ack=wait_ack,
             )
             if choice == "cancel":
@@ -830,6 +881,13 @@ def run_wizard(client: VescClient, args: argparse.Namespace) -> None:
 
     config = client.get_appconf()
     validate_required_fields(config)
+    if args.mean_seconds > 0.0:
+        print(
+            f"Calibration readouts and saved values use a "
+            f"{args.mean_seconds:g} second rolling mean."
+        )
+    else:
+        print("Calibration readouts and saved values use instantaneous filtered values.")
 
     if not args.skip_basic:
         run_basic_step(
@@ -850,6 +908,7 @@ def run_wizard(client: VescClient, args: argparse.Namespace) -> None:
             assume_yes=args.yes,
             poll_hz=args.rate,
             sample_seconds=args.sample_seconds,
+            mean_seconds=args.mean_seconds,
             wait_ack=args.wait_ack,
         )
 
@@ -860,6 +919,7 @@ def run_wizard(client: VescClient, args: argparse.Namespace) -> None:
             assume_yes=args.yes,
             poll_hz=args.rate,
             sample_seconds=args.sample_seconds,
+            mean_seconds=args.mean_seconds,
             wait_ack=args.wait_ack,
         )
 
@@ -870,6 +930,7 @@ def run_wizard(client: VescClient, args: argparse.Namespace) -> None:
             assume_yes=args.yes,
             poll_hz=args.rate,
             sample_seconds=args.sample_seconds,
+            mean_seconds=args.mean_seconds,
             wait_ack=args.wait_ack,
         )
 
@@ -935,6 +996,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sample duration for each IMU type during search (default: 2.0).",
     )
     parser.add_argument(
+        "--mean-seconds",
+        type=float,
+        default=DEFAULT_MEAN_SECONDS,
+        metavar="SEC",
+        help=(
+            "Rolling mean window for displayed and saved calibration values "
+            "(default: 3.0, use 0 to disable)."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         choices=[profile.value for profile in ImuBasicProfile] + ["current"],
         metavar="PROFILE",
@@ -978,6 +1049,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--sample-seconds must be greater than 0")
     if args.search_seconds <= 0.0:
         raise SystemExit("--search-seconds must be greater than 0")
+    if args.mean_seconds < 0.0:
+        raise SystemExit("--mean-seconds must be greater than or equal to 0")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
