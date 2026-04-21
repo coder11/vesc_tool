@@ -106,6 +106,7 @@ vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102
 python examples/imu_setup.py
 python examples/imu_setup.py --tcp 192.168.1.100:65102
 python examples/imu_setup.py --scan-udp
+python examples/imu_setup_gui.py
 ```
 
 The setup wizard mirrors the VESC Tool IMU setup flow: basic IMU parameters,
@@ -116,6 +117,9 @@ orientation steps keep sampling until you press `s`/Enter to save, `r` to retry,
 `k` to skip, or `c` to cancel. Calibration readouts and saved calibration values
 use a 3 second rolling mean by default; pass `--mean-seconds 0` to disable it or
 another value to tune the window.
+
+`imu_setup_gui.py` provides a PySide6 clone of the VESC Tool IMU wizard with the
+same detector/profile, gyro, accelerometer, and orientation pages.
 
 ## Project structure
 
@@ -141,6 +145,7 @@ python/
   examples/
     imu_live_plot.py       # PyQtGraph live IMU plot
     imu_setup.py           # Interactive IMU setup wizard
+    imu_setup_gui.py       # PySide6 IMU setup wizard
 ```
 
 ## Protocol notes

@@ -21,7 +21,6 @@ import termios
 import time
 import tty
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Literal, SupportsInt, cast
 
 from vesc_py import VescClient, udp_scan
@@ -29,6 +28,7 @@ from vesc_py.imu_setup import (
     IMU_SETUP_MASK,
     FilteredImuState,
     ImuBasicProfile,
+    OrientationRestore,
     RollingMeanImuState,
     RollingMeanValue,
     YawOffsetEstimator,
@@ -36,13 +36,19 @@ from vesc_py.imu_setup import (
     apply_pitch_offset,
     apply_roll_offset,
     apply_yaw_offset,
+    axis_current,
+    axis_max,
     config_float,
     config_int,
     imu_type_name,
+    mean_label,
     prepare_orientation_calibration,
+    restore_orientation_config,
     save_accel_offset,
     save_gyro_offsets,
+    save_orientation_restore,
     set_config_int,
+    validate_required_fields,
 )
 
 DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
@@ -57,21 +63,6 @@ StepChoice = Literal["save", "retry", "skip", "cancel"]
 STEP_PROMPT = "s/Enter=save  r=retry  k=skip  c=cancel"
 PostUpdateCallback = Callable[[float, FilteredImuState], None]
 StatusCallback = Callable[[FilteredImuState, FilteredImuState], str]
-
-
-@dataclass(frozen=True)
-class OrientationRestore:
-    """APPCONF fields restored when orientation calibration is cancelled."""
-
-    rot_roll: float
-    rot_pitch: float
-    rot_yaw: float
-    gyro_offsets_0: float
-    gyro_offsets_1: float
-    gyro_offsets_2: float
-    accel_offsets_0: float
-    accel_offsets_1: float
-    accel_offsets_2: float
 
 
 def parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
@@ -220,14 +211,6 @@ def write_appconf(
     """Write APPCONF, matching the QML wizard's store/no-store distinction."""
 
     client.set_appconf(config, store=store, wait_ack=wait_ack)
-
-
-def mean_label(mean_seconds: float) -> str:
-    """Return a short label for the displayed calibration value."""
-
-    if mean_seconds > 0.0:
-        return f"rolling {mean_seconds:g}s"
-    return "instant"
 
 
 class StatusBlockRenderer:
@@ -562,30 +545,6 @@ def run_gyro_step(
             return
 
 
-def axis_max(state: FilteredImuState, axis: str) -> float:
-    """Return max accelerometer value for an axis."""
-
-    if axis == "x":
-        return state.max_acc_x
-    if axis == "y":
-        return state.max_acc_y
-    if axis == "z":
-        return state.max_acc_z
-    raise ValueError("axis must be 'x', 'y', or 'z'")
-
-
-def axis_current(state: FilteredImuState, axis: str) -> float:
-    """Return current filtered accelerometer value for an axis."""
-
-    if axis == "x":
-        return state.acc_x
-    if axis == "y":
-        return state.acc_y
-    if axis == "z":
-        return state.acc_z
-    raise ValueError("axis must be 'x', 'y', or 'z'")
-
-
 def run_accel_step(
     client: VescClient,
     config: dict[str, object],
@@ -650,36 +609,6 @@ def run_accel_step(
             if choice == "cancel":
                 print("Cancelled accelerometer calibration.")
                 return
-
-
-def save_orientation_restore(config: dict[str, object]) -> OrientationRestore:
-    """Snapshot orientation and calibration fields."""
-
-    return OrientationRestore(
-        rot_roll=config_float(config, "imu_conf.rot_roll"),
-        rot_pitch=config_float(config, "imu_conf.rot_pitch"),
-        rot_yaw=config_float(config, "imu_conf.rot_yaw"),
-        gyro_offsets_0=config_float(config, "imu_conf.gyro_offsets__0"),
-        gyro_offsets_1=config_float(config, "imu_conf.gyro_offsets__1"),
-        gyro_offsets_2=config_float(config, "imu_conf.gyro_offsets__2"),
-        accel_offsets_0=config_float(config, "imu_conf.accel_offsets__0"),
-        accel_offsets_1=config_float(config, "imu_conf.accel_offsets__1"),
-        accel_offsets_2=config_float(config, "imu_conf.accel_offsets__2"),
-    )
-
-
-def restore_orientation_config(config: dict[str, object], restore: OrientationRestore) -> None:
-    """Restore an orientation snapshot to APPCONF."""
-
-    config["imu_conf.rot_roll"] = restore.rot_roll
-    config["imu_conf.rot_pitch"] = restore.rot_pitch
-    config["imu_conf.rot_yaw"] = restore.rot_yaw
-    config["imu_conf.gyro_offsets__0"] = restore.gyro_offsets_0
-    config["imu_conf.gyro_offsets__1"] = restore.gyro_offsets_1
-    config["imu_conf.gyro_offsets__2"] = restore.gyro_offsets_2
-    config["imu_conf.accel_offsets__0"] = restore.accel_offsets_0
-    config["imu_conf.accel_offsets__1"] = restore.accel_offsets_1
-    config["imu_conf.accel_offsets__2"] = restore.accel_offsets_2
 
 
 def run_roll_orientation(
@@ -915,33 +844,6 @@ def run_orientation_step(
         f"  Pitch: {config_float(config, 'imu_conf.rot_pitch'):+.6f} deg\n"
         f"  Yaw:   {config_float(config, 'imu_conf.rot_yaw'):+.6f} deg"
     )
-
-
-def validate_required_fields(config: dict[str, object]) -> None:
-    """Fail early if this firmware lacks the fields used by the wizard."""
-
-    required_names = [
-        "imu_conf.type",
-        "imu_conf.sample_rate_hz",
-        "imu_conf.mode",
-        "imu_conf.accel_confidence_decay",
-        "imu_conf.mahony_kp",
-        "imu_conf.accel_lowpass_filter_z",
-        "imu_conf.gyro_lowpass_filter",
-        "imu_conf.rot_roll",
-        "imu_conf.rot_pitch",
-        "imu_conf.rot_yaw",
-        "imu_conf.accel_offsets__0",
-        "imu_conf.accel_offsets__1",
-        "imu_conf.accel_offsets__2",
-        "imu_conf.gyro_offsets__0",
-        "imu_conf.gyro_offsets__1",
-        "imu_conf.gyro_offsets__2",
-    ]
-    missing = [name for name in required_names if name not in config]
-    if missing:
-        names = ", ".join(missing)
-        raise RuntimeError(f"APPCONF is missing required IMU setup fields: {names}")
 
 
 def run_wizard(client: VescClient, args: argparse.Namespace) -> None:

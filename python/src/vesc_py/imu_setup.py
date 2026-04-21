@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import MutableMapping, SupportsFloat, SupportsInt, cast
@@ -52,6 +52,42 @@ class AxisTriple:
     roll: float
     pitch: float
     yaw: float
+
+
+@dataclass(frozen=True)
+# pylint: disable=too-many-instance-attributes
+class OrientationRestore:
+    """APPCONF fields restored when orientation calibration is cancelled."""
+
+    rot_roll: float
+    rot_pitch: float
+    rot_yaw: float
+    gyro_offsets_0: float
+    gyro_offsets_1: float
+    gyro_offsets_2: float
+    accel_offsets_0: float
+    accel_offsets_1: float
+    accel_offsets_2: float
+
+
+REQUIRED_IMU_SETUP_FIELDS = (
+    "imu_conf.type",
+    "imu_conf.sample_rate_hz",
+    "imu_conf.mode",
+    "imu_conf.accel_confidence_decay",
+    "imu_conf.mahony_kp",
+    "imu_conf.accel_lowpass_filter_z",
+    "imu_conf.gyro_lowpass_filter",
+    "imu_conf.rot_roll",
+    "imu_conf.rot_pitch",
+    "imu_conf.rot_yaw",
+    "imu_conf.accel_offsets__0",
+    "imu_conf.accel_offsets__1",
+    "imu_conf.accel_offsets__2",
+    "imu_conf.gyro_offsets__0",
+    "imu_conf.gyro_offsets__1",
+    "imu_conf.gyro_offsets__2",
+)
 
 
 @dataclass
@@ -248,7 +284,7 @@ class YawOffsetEstimator:
             self.yaw_offset = math.pi
 
 
-def config_float(config: MutableMapping[str, object], name: str) -> float:
+def config_float(config: Mapping[str, object], name: str) -> float:
     """Read a required floating-point APPCONF value."""
 
     try:
@@ -257,7 +293,7 @@ def config_float(config: MutableMapping[str, object], name: str) -> float:
         raise KeyError(f"APPCONF is missing required IMU parameter {name!r}") from exc
 
 
-def config_int(config: MutableMapping[str, object], name: str) -> int:
+def config_int(config: Mapping[str, object], name: str) -> int:
     """Read a required integer APPCONF value."""
 
     try:
@@ -294,6 +330,38 @@ def imu_type_name(imu_type: int) -> str:
     """Return a display name for a VESC ``imu_conf.type`` enum value."""
 
     return IMU_TYPE_NAMES.get(imu_type, f"Unknown ({imu_type})")
+
+
+def mean_label(mean_seconds: float) -> str:
+    """Return a short label for displayed calibration values."""
+
+    if mean_seconds > 0.0:
+        return f"rolling {mean_seconds:g}s"
+    return "instant"
+
+
+def axis_max(state: FilteredImuState, axis: str) -> float:
+    """Return max accelerometer value for an axis."""
+
+    if axis == "x":
+        return state.max_acc_x
+    if axis == "y":
+        return state.max_acc_y
+    if axis == "z":
+        return state.max_acc_z
+    raise ValueError("axis must be 'x', 'y', or 'z'")
+
+
+def axis_current(state: FilteredImuState, axis: str) -> float:
+    """Return current filtered accelerometer value for an axis."""
+
+    if axis == "x":
+        return state.acc_x
+    if axis == "y":
+        return state.acc_y
+    if axis == "z":
+        return state.acc_z
+    raise ValueError("axis must be 'x', 'y', or 'z'")
 
 
 def apply_basic_profile(
@@ -509,3 +577,45 @@ def pitch_for_yaw_offset(values: ImuValues | AxisTriple, yaw: float) -> float:
     """Return pitch after applying a candidate yaw offset."""
 
     return rotate_euler_angles(_axis_from_values(values), AxisTriple(0.0, 0.0, yaw)).pitch
+
+
+def save_orientation_restore(config: Mapping[str, object]) -> OrientationRestore:
+    """Snapshot orientation and calibration fields."""
+
+    return OrientationRestore(
+        rot_roll=config_float(config, "imu_conf.rot_roll"),
+        rot_pitch=config_float(config, "imu_conf.rot_pitch"),
+        rot_yaw=config_float(config, "imu_conf.rot_yaw"),
+        gyro_offsets_0=config_float(config, "imu_conf.gyro_offsets__0"),
+        gyro_offsets_1=config_float(config, "imu_conf.gyro_offsets__1"),
+        gyro_offsets_2=config_float(config, "imu_conf.gyro_offsets__2"),
+        accel_offsets_0=config_float(config, "imu_conf.accel_offsets__0"),
+        accel_offsets_1=config_float(config, "imu_conf.accel_offsets__1"),
+        accel_offsets_2=config_float(config, "imu_conf.accel_offsets__2"),
+    )
+
+
+def restore_orientation_config(
+    config: MutableMapping[str, object],
+    restore: OrientationRestore,
+) -> None:
+    """Restore an orientation snapshot to APPCONF."""
+
+    config["imu_conf.rot_roll"] = restore.rot_roll
+    config["imu_conf.rot_pitch"] = restore.rot_pitch
+    config["imu_conf.rot_yaw"] = restore.rot_yaw
+    config["imu_conf.gyro_offsets__0"] = restore.gyro_offsets_0
+    config["imu_conf.gyro_offsets__1"] = restore.gyro_offsets_1
+    config["imu_conf.gyro_offsets__2"] = restore.gyro_offsets_2
+    config["imu_conf.accel_offsets__0"] = restore.accel_offsets_0
+    config["imu_conf.accel_offsets__1"] = restore.accel_offsets_1
+    config["imu_conf.accel_offsets__2"] = restore.accel_offsets_2
+
+
+def validate_required_fields(config: Mapping[str, object]) -> None:
+    """Fail early if this firmware lacks fields used by the IMU setup wizard."""
+
+    missing = [name for name in REQUIRED_IMU_SETUP_FIELDS if name not in config]
+    if missing:
+        names = ", ".join(missing)
+        raise RuntimeError(f"APPCONF is missing required IMU setup fields: {names}")
