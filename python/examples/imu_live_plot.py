@@ -6,6 +6,7 @@ Start the bridge first, for example:
 
 Usage:
     python examples/imu_live_plot.py
+    python examples/imu_live_plot.py --theme dark
     python examples/imu_live_plot.py --tcp 192.168.1.50:65102
     python examples/imu_live_plot.py --scan-udp
 """
@@ -35,6 +36,7 @@ DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_POLL_HZ = 50.0
 DEFAULT_SPECTRUM_REFRESH_HZ = 2.0
 DEFAULT_STATUS_REFRESH_HZ = 4.0
+DEFAULT_THEME = "light"
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
 ROLL_INDEX = 0
 PITCH_INDEX = 1
@@ -46,6 +48,41 @@ GYRO_X_INDEX = 6
 GYRO_Y_INDEX = 7
 GYRO_Z_INDEX = 8
 IMU_PLOT_CHANNELS = 9
+
+
+@dataclass(frozen=True)
+class PlotTheme:
+    """Colors for the live plot window and PyQtGraph widgets."""
+
+    pg_background: str
+    pg_foreground: str
+    window_background: str
+    title_color: str
+    status_color: str
+    grid_alpha: float
+    line_colors: tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
+
+
+PLOT_THEMES: dict[str, PlotTheme] = {
+    "light": PlotTheme(
+        pg_background="#ffffff",
+        pg_foreground="#202124",
+        window_background="#f6f7f9",
+        title_color="#202124",
+        status_color="#4f5b66",
+        grid_alpha=0.22,
+        line_colors=((196, 57, 54), (28, 128, 75), (37, 98, 180)),
+    ),
+    "dark": PlotTheme(
+        pg_background="#000000",
+        pg_foreground="#d0d0d0",
+        window_background="#000000",
+        title_color="#999999",
+        status_color="#999999",
+        grid_alpha=0.3,
+        line_colors=((230, 88, 85), (80, 190, 120), (85, 150, 245)),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -301,7 +338,7 @@ def import_pyqtgraph() -> tuple[Any, Any, Any]:
     try:
         import pyqtgraph as pg  # type: ignore[import-untyped]
         from pyqtgraph.Qt import QtCore  # type: ignore[import-untyped]
-        from pyqtgraph.Qt import QtWidgets  # type: ignore[import-untyped]
+        from pyqtgraph.Qt import QtWidgets
     except ImportError as exc:
         raise RuntimeError(
             "PyQtGraph live plotting requires pyqtgraph and a Qt binding. "
@@ -342,10 +379,16 @@ def run_live_plot(
     show_freq: bool = False,
     spectrum_refresh_hz: float = DEFAULT_SPECTRUM_REFRESH_HZ,
     antialias: bool = False,
+    theme: str = DEFAULT_THEME,
 ) -> None:
     """Run a PyQtGraph live plot of IMU data."""
+    selected_theme = PLOT_THEMES[theme]
     pg, QtCore, QtWidgets = import_pyqtgraph()
-    pg.setConfigOptions(antialias=antialias)
+    pg.setConfigOptions(
+        antialias=antialias,
+        background=selected_theme.pg_background,
+        foreground=selected_theme.pg_foreground,
+    )
 
     rad2deg = 180.0 / math.pi
     imu_history = ImuHistory(history)
@@ -368,9 +411,11 @@ def run_live_plot(
     qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
     title = QtWidgets.QLabel("VESC IMU Live Data")
     title.setAlignment(qt_alignment.AlignCenter)
-    title.setStyleSheet("font-size: 14pt; font-weight: 700; color: #999999;")
+    title.setStyleSheet(
+        f"font-size: 14pt; font-weight: 700; color: {selected_theme.title_color};"
+    )
     status = QtWidgets.QLabel("Waiting for IMU data... | Sample: measuring | Plot: measuring")
-    status.setStyleSheet("color: #999999;")
+    status.setStyleSheet(f"color: {selected_theme.status_color};")
 
     layout = QtWidgets.QGridLayout(window)
     layout.setContentsMargins(0, 0, 0, 0)
@@ -381,7 +426,7 @@ def run_live_plot(
         layout.setRowStretch(plot_row, 1)
     for plot_col in range(column_count):
         layout.setColumnStretch(plot_col, 1)
-    window.setStyleSheet("background-color: #000000;")
+    window.setStyleSheet(f"background-color: {selected_theme.window_background};")
     qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
 
     def _make_plot(
@@ -402,7 +447,7 @@ def run_live_plot(
         )
         layout.addWidget(plot_widget, row, col)
         plot = plot_widget.getPlotItem()
-        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
         plot.addLegend(offset=(10, 10))
         plot.setLabel("left", y_label)
         plot.getAxis("left").setWidth(56)
@@ -422,9 +467,8 @@ def run_live_plot(
         initial_x: np.ndarray = x,
         initial_y: np.ndarray = zeros,
     ) -> tuple[Any, Any, Any]:
-        colors = ((230, 88, 85), (80, 190, 120), (85, 150, 245))
         lines = []
-        for name, color in zip(names, colors):
+        for name, color in zip(names, selected_theme.line_colors):
             line = pg.PlotCurveItem(
                 initial_x,
                 initial_y,
@@ -770,6 +814,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render smoother lines at the cost of lower redraw performance.",
     )
     parser.add_argument(
+        "--theme",
+        choices=tuple(PLOT_THEMES),
+        default=DEFAULT_THEME,
+        help=f"Plot color theme (default: {DEFAULT_THEME}).",
+    )
+    parser.add_argument(
         "--spectrum-refresh-rate",
         type=float,
         default=DEFAULT_SPECTRUM_REFRESH_HZ,
@@ -836,6 +886,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             show_freq=args.show_freq,
             spectrum_refresh_hz=args.spectrum_refresh_rate,
             antialias=args.antialias,
+            theme=args.theme,
         )
     except KeyboardInterrupt:
         print("\nStopped.")
