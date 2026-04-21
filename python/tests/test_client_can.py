@@ -111,3 +111,25 @@ def test_set_appconf_waits_for_ack() -> None:
 
     payload = _decode_sent_payload(transport.sent[0])
     assert payload[0] == CommPacketId.COMM_SET_APPCONF
+
+
+def test_get_imu_data_skips_queued_appconf_ack() -> None:
+    imu_response = VescBuffer()
+    imu_response.append_uint8(CommPacketId.COMM_GET_IMU_DATA)
+    imu_response.append_uint16(0x0001)
+    imu_response.append_double32_auto(1.25)
+
+    transport = FakeTransport(
+        [
+            encode_packet(bytes([CommPacketId.COMM_SET_APPCONF_NO_STORE])),
+            encode_packet(imu_response.to_bytes()),
+        ]
+    )
+    client = VescClient(transport, timeout=0.1)
+
+    imu = client.get_imu_data(0x0001)
+
+    assert imu.roll == 1.25
+    assert _decode_sent_payload(transport.sent[0]) == bytes(
+        [CommPacketId.COMM_GET_IMU_DATA, 0x00, 0x01]
+    )

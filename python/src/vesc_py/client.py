@@ -251,7 +251,9 @@ class VescClient:
     def get_imu_data(self, mask: int = 0xFFFF) -> ImuValues:
         """Request IMU data with the given field mask."""
         self._send_command(build_get_imu_data(mask))
-        payload = self._recv_response()
+        payload = self._recv_response(
+            expected_cmds={int(CommPacketId.COMM_GET_IMU_DATA)},
+        )
         return parse_imu_data(payload)
 
     def _get_config(

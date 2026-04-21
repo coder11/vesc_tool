@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+"""Interactive IMU setup wizard through the VESC Tool TCP server.
+
+Start the bridge first, for example:
+    ./vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102
+
+Usage:
+    python examples/imu_setup.py
+    python examples/imu_setup.py --tcp 192.168.1.50:65102
+    python examples/imu_setup.py --scan-udp
+"""
+
+# pylint: disable=too-many-arguments,too-many-instance-attributes
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Literal, SupportsInt, cast
+
+from vesc_py import VescClient, udp_scan
+from vesc_py.imu_setup import (
+    IMU_SETUP_MASK,
+    FilteredImuState,
+    ImuBasicProfile,
+    YawOffsetEstimator,
+    apply_basic_profile,
+    apply_pitch_offset,
+    apply_roll_offset,
+    apply_yaw_offset,
+    config_float,
+    config_int,
+    imu_type_name,
+    prepare_orientation_calibration,
+    save_accel_offset,
+    save_gyro_offsets,
+    set_config_int,
+)
+
+DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
+DEFAULT_POLL_HZ = 50.0
+DEFAULT_SAMPLE_SECONDS = 5.0
+DEFAULT_SEARCH_SECONDS = 2.0
+RAD_TO_DEG = 180.0 / 3.141592653589793
+DEG_TO_RAD = 3.141592653589793 / 180.0
+ProfileChoice = Literal["current", "default", "logs", "balance-unicycle", "balance-skateboard"]
+StepChoice = Literal["save", "retry", "skip", "cancel"]
+
+
+@dataclass(frozen=True)
+class OrientationRestore:
+    """APPCONF fields restored when orientation calibration is cancelled."""
+
+    rot_roll: float
+    rot_pitch: float
+    rot_yaw: float
+    gyro_offsets_0: float
+    gyro_offsets_1: float
+    gyro_offsets_2: float
+    accel_offsets_0: float
+    accel_offsets_1: float
+    accel_offsets_2: float
+
+
+def parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
+    """Parse HOST:PORT for argparse."""
+
+    host, sep, port_str = endpoint.rpartition(":")
+    if not sep or not host or not port_str:
+        raise argparse.ArgumentTypeError("TCP endpoint must be HOST:PORT")
+
+    try:
+        port = int(port_str)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("TCP port must be an integer") from exc
+
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("TCP port must be in range 1..65535")
+
+    return host, port
+
+
+def scan_and_print_udp(timeout: float = 3.0) -> None:
+    """Listen for VESC Tool TCP server broadcast announcements and print them."""
+
+    print(f"Listening for VESC Tool TCP server broadcasts on UDP port 65109 for {timeout}s ...")
+    devices = udp_scan(timeout=timeout)
+    if not devices:
+        print("No VESC Tool TCP servers found.")
+        return
+
+    for device in devices:
+        print(f"  {device.hw_name}  {device.ip}:{device.port}")
+
+
+def tcp_server_help(endpoint: str, port: int) -> str:
+    """Return a concise hint for starting the VESC Tool TCP bridge."""
+
+    return "\n".join(
+        [
+            f"Could not connect to VESC Tool TCP server at {endpoint}.",
+            "",
+            "Start VESC Tool with tcpServer enabled, then retry. For example:",
+            f"  vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer {port}",
+            "",
+            "If VESC Tool is already running, check the host and port passed to --tcp.",
+        ]
+    )
+
+
+def prompt_bool(prompt: str, *, default: bool) -> bool:
+    """Prompt for a yes/no answer."""
+
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"{prompt} [{suffix}] ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def prompt_profile(default: ProfileChoice) -> ProfileChoice:
+    """Prompt for the basic IMU parameter profile."""
+
+    choices: dict[str, ProfileChoice] = {
+        "c": "current",
+        "d": "default",
+        "l": "logs",
+        "u": "balance-unicycle",
+        "s": "balance-skateboard",
+    }
+    labels = {
+        "current": "keep current values",
+        "default": "Default",
+        "logs": "Logs",
+        "balance-unicycle": "Balance Unicycle",
+        "balance-skateboard": "Balance Skateboard",
+    }
+    print("Choose basic IMU profile:")
+    print("  c  keep current values")
+    print("  d  Default")
+    print("  l  Logs")
+    print("  u  Balance Unicycle")
+    print("  s  Balance Skateboard")
+    while True:
+        answer = input(f"Profile [{default[0]} = {labels[default]}] ").strip().lower()
+        if not answer:
+            return default
+        if answer in choices:
+            return choices[answer]
+        for value in labels:
+            if answer == value:
+                return cast(ProfileChoice, value)
+        print("Please choose c, d, l, u, or s.")
+
+
+def prompt_step(default: StepChoice = "save") -> StepChoice:
+    """Prompt for a calibration-step action."""
+
+    choices: dict[str, StepChoice] = {
+        "s": "save",
+        "r": "retry",
+        "k": "skip",
+        "c": "cancel",
+    }
+    while True:
+        answer = input(f"Action: save, retry, skip, cancel [{default}] ").strip().lower()
+        if not answer:
+            return default
+        if answer in choices:
+            return choices[answer]
+        if answer in choices.values():
+            return cast(StepChoice, answer)
+        print("Please choose save, retry, skip, or cancel.")
+
+
+def wait_for_enter(message: str, *, assume_yes: bool) -> None:
+    """Wait for operator confirmation unless --yes is active."""
+
+    if assume_yes:
+        print(message)
+        return
+    input(f"{message}\nPress Enter when ready...")
+
+
+def write_appconf(
+    client: VescClient,
+    config: dict[str, object],
+    *,
+    store: bool,
+    wait_ack: bool,
+) -> None:
+    """Write APPCONF, matching the QML wizard's store/no-store distinction."""
+
+    client.set_appconf(config, store=store, wait_ack=wait_ack)
+
+
+def sample_filtered_imu(
+    client: VescClient,
+    *,
+    seconds: float,
+    poll_hz: float,
+    status: Callable[[FilteredImuState], str] | None = None,
+    yaw_estimator: YawOffsetEstimator | None = None,
+) -> FilteredImuState:
+    """Poll and filter IMU data for a fixed duration."""
+
+    state = FilteredImuState()
+    period = 1.0 / poll_hz
+    end_time = time.monotonic() + seconds
+    next_poll = time.monotonic()
+    next_status = 0.0
+
+    while time.monotonic() < end_time:
+        values = client.get_imu_data(IMU_SETUP_MASK)
+        state.update(values)
+        if yaw_estimator is not None:
+            yaw_estimator.update(values)
+
+        now = time.monotonic()
+        if status is not None and now >= next_status:
+            print(f"\r{status(state)}", end="", flush=True)
+            next_status = now + 0.25
+
+        next_poll += period
+        sleep_s = max(0.0, next_poll - time.monotonic())
+        if sleep_s > 0.0:
+            time.sleep(sleep_s)
+        else:
+            next_poll = time.monotonic()
+
+    if status is not None:
+        print()
+    return state
+
+
+def print_basic_config(config: dict[str, object]) -> None:
+    """Print the fields controlled by the basic setup step."""
+
+    imu_type = config_int(config, "imu_conf.type")
+    print(
+        "Current IMU config:\n"
+        f"  Type:             {imu_type_name(imu_type)} ({imu_type})\n"
+        f"  Sample rate:      {config_int(config, 'imu_conf.sample_rate_hz')} Hz\n"
+        f"  AHRS mode:        {config_int(config, 'imu_conf.mode')}\n"
+        f"  Acc decay:        {config_float(config, 'imu_conf.accel_confidence_decay'):.3f}\n"
+        f"  Mahony kp:        {config_float(config, 'imu_conf.mahony_kp'):.3f}\n"
+        f"  Accel Z filter:   {config_float(config, 'imu_conf.accel_lowpass_filter_z'):.1f}\n"
+        f"  Gyro filter:      {config_float(config, 'imu_conf.gyro_lowpass_filter'):.1f}"
+    )
+
+
+def search_imu_type(
+    client: VescClient,
+    config: dict[str, object],
+    *,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> int:
+    """Try IMU type enum values 1..5 with temporary APPCONF writes."""
+
+    previous_app_raw = config.get("app_to_use")
+    previous_app = (
+        int(cast(SupportsInt, previous_app_raw)) if previous_app_raw is not None else None
+    )
+    if previous_app is not None:
+        set_config_int(config, "app_to_use", 0)
+
+    found_type = 0
+    print("Searching IMU types with temporary config writes...")
+    for imu_type in range(1, 6):
+        set_config_int(config, "imu_conf.type", imu_type)
+        write_appconf(client, config, store=False, wait_ack=wait_ack)
+
+        def status(state: FilteredImuState, name: str = imu_type_name(imu_type)) -> str:
+            return f"Testing {name}: gyro noise {state.gyro_x_noise:.4f}"
+
+        state = sample_filtered_imu(
+            client,
+            seconds=sample_seconds,
+            poll_hz=poll_hz,
+            status=status,
+        )
+        if state.working_imu:
+            found_type = imu_type
+            break
+
+    set_config_int(config, "imu_conf.type", found_type)
+    if previous_app is not None:
+        set_config_int(config, "app_to_use", previous_app)
+    write_appconf(client, config, store=False, wait_ack=wait_ack)
+    print(f"IMU search result: {imu_type_name(found_type)} ({found_type})")
+    return found_type
+
+
+def run_basic_step(
+    client: VescClient,
+    config: dict[str, object],
+    *,
+    profile_arg: str | None,
+    search_arg: bool | None,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> None:
+    """Run the basic parameter selection step."""
+
+    print("\nStep 1/4: Basic IMU parameters")
+    original = dict(config)
+    print_basic_config(config)
+
+    do_search = (
+        search_arg
+        if search_arg is not None
+        else prompt_bool("Search for a working IMU type?", default=False)
+    )
+    if do_search:
+        search_imu_type(
+            client,
+            config,
+            poll_hz=poll_hz,
+            sample_seconds=sample_seconds,
+            wait_ack=wait_ack,
+        )
+
+    if profile_arg is not None:
+        profile_choice = profile_arg
+    elif assume_yes:
+        profile_choice = ImuBasicProfile.DEFAULT.value
+    else:
+        profile_choice = prompt_profile("default")
+
+    if profile_choice != "current":
+        profile = ImuBasicProfile(profile_choice)
+        apply_basic_profile(config, profile)
+        print(f"Selected profile: {profile.value}")
+    else:
+        print("Keeping current basic parameter values.")
+
+    print_basic_config(config)
+    should_save = assume_yes or prompt_bool("Store these basic IMU parameters?", default=True)
+    if should_save:
+        write_appconf(client, config, store=True, wait_ack=wait_ack)
+        print("Stored basic IMU parameters.")
+    else:
+        config.clear()
+        config.update(original)
+        write_appconf(client, config, store=False, wait_ack=wait_ack)
+        print("Basic parameter changes discarded.")
+
+
+def run_gyro_step(
+    client: VescClient,
+    config: dict[str, object],
+    *,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> None:
+    """Run the gyro-offset calibration step."""
+
+    print("\nStep 2/4: Gyroscope calibration")
+    while True:
+        wait_for_enter(
+            "Leave the IMU stable in any orientation without vibration.",
+            assume_yes=assume_yes,
+        )
+        state = sample_filtered_imu(
+            client,
+            seconds=sample_seconds,
+            poll_hz=poll_hz,
+            status=lambda s: (
+                f"Gyro offsets X {s.gyro_x:+.3f}  "
+                f"Y {s.gyro_y:+.3f}  Z {s.gyro_z:+.3f}"
+            ),
+        )
+        print(
+            f"Measured gyro offsets: X {state.gyro_x:+.6f}, "
+            f"Y {state.gyro_y:+.6f}, Z {state.gyro_z:+.6f}"
+        )
+        choice = "save" if assume_yes else prompt_step()
+        if choice == "save":
+            save_gyro_offsets(config, state)
+            write_appconf(client, config, store=True, wait_ack=wait_ack)
+            print("Stored gyroscope offsets.")
+            return
+        if choice == "skip":
+            print("Skipped gyroscope calibration.")
+            return
+        if choice == "cancel":
+            print("Cancelled gyroscope calibration.")
+            return
+
+
+def axis_max(state: FilteredImuState, axis: str) -> float:
+    """Return max accelerometer value for an axis."""
+
+    if axis == "x":
+        return state.max_acc_x
+    if axis == "y":
+        return state.max_acc_y
+    if axis == "z":
+        return state.max_acc_z
+    raise ValueError("axis must be 'x', 'y', or 'z'")
+
+
+def axis_current(state: FilteredImuState, axis: str) -> float:
+    """Return current filtered accelerometer value for an axis."""
+
+    if axis == "x":
+        return state.acc_x
+    if axis == "y":
+        return state.acc_y
+    if axis == "z":
+        return state.acc_z
+    raise ValueError("axis must be 'x', 'y', or 'z'")
+
+
+def run_accel_step(
+    client: VescClient,
+    config: dict[str, object],
+    *,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> None:
+    """Run the accelerometer max-axis calibration step."""
+
+    print("\nStep 3/4: Accelerometer calibration")
+    for axis in ("x", "y", "z"):
+        while True:
+            wait_for_enter(
+                f"Rotate the IMU to a stable maximum positive {axis.upper()} acceleration.",
+                assume_yes=assume_yes,
+            )
+
+            def status(state: FilteredImuState, current_axis: str = axis) -> str:
+                return (
+                    f"{current_axis.upper()} {axis_current(state, current_axis):+.3f}  "
+                    f"Max {axis_max(state, current_axis):+.3f}"
+                )
+
+            state = sample_filtered_imu(
+                client,
+                seconds=sample_seconds,
+                poll_hz=poll_hz,
+                status=status,
+            )
+            max_value = axis_max(state, axis)
+            print(f"Measured max {axis.upper()}: {max_value:+.6f}")
+            choice = "save" if assume_yes else prompt_step()
+            if choice == "save":
+                save_accel_offset(config, axis, max_value)
+                write_appconf(client, config, store=True, wait_ack=wait_ack)
+                print(f"Stored accelerometer {axis.upper()} offset.")
+                break
+            if choice == "skip":
+                print(f"Skipped accelerometer {axis.upper()} calibration.")
+                break
+            if choice == "cancel":
+                print("Cancelled accelerometer calibration.")
+                return
+
+
+def save_orientation_restore(config: dict[str, object]) -> OrientationRestore:
+    """Snapshot orientation and calibration fields."""
+
+    return OrientationRestore(
+        rot_roll=config_float(config, "imu_conf.rot_roll"),
+        rot_pitch=config_float(config, "imu_conf.rot_pitch"),
+        rot_yaw=config_float(config, "imu_conf.rot_yaw"),
+        gyro_offsets_0=config_float(config, "imu_conf.gyro_offsets__0"),
+        gyro_offsets_1=config_float(config, "imu_conf.gyro_offsets__1"),
+        gyro_offsets_2=config_float(config, "imu_conf.gyro_offsets__2"),
+        accel_offsets_0=config_float(config, "imu_conf.accel_offsets__0"),
+        accel_offsets_1=config_float(config, "imu_conf.accel_offsets__1"),
+        accel_offsets_2=config_float(config, "imu_conf.accel_offsets__2"),
+    )
+
+
+def restore_orientation_config(config: dict[str, object], restore: OrientationRestore) -> None:
+    """Restore an orientation snapshot to APPCONF."""
+
+    config["imu_conf.rot_roll"] = restore.rot_roll
+    config["imu_conf.rot_pitch"] = restore.rot_pitch
+    config["imu_conf.rot_yaw"] = restore.rot_yaw
+    config["imu_conf.gyro_offsets__0"] = restore.gyro_offsets_0
+    config["imu_conf.gyro_offsets__1"] = restore.gyro_offsets_1
+    config["imu_conf.gyro_offsets__2"] = restore.gyro_offsets_2
+    config["imu_conf.accel_offsets__0"] = restore.accel_offsets_0
+    config["imu_conf.accel_offsets__1"] = restore.accel_offsets_1
+    config["imu_conf.accel_offsets__2"] = restore.accel_offsets_2
+
+
+def run_roll_orientation(
+    client: VescClient,
+    config: dict[str, object],
+    restore: OrientationRestore,
+    *,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> StepChoice:
+    """Run the roll orientation sub-step."""
+
+    while True:
+        wait_for_enter(
+            "Place the IMU level on a flat stable surface for roll calibration.",
+            assume_yes=assume_yes,
+        )
+        state = sample_filtered_imu(
+            client,
+            seconds=sample_seconds,
+            poll_hz=poll_hz,
+            status=lambda s: (
+                f"Roll offset {(-s.roll * RAD_TO_DEG - restore.rot_roll):+.3f} deg"
+            ),
+        )
+        print(f"Measured roll offset: {(-state.roll * RAD_TO_DEG - restore.rot_roll):+.6f} deg")
+        choice = "save" if assume_yes else prompt_step()
+        if choice == "save":
+            apply_roll_offset(config, -state.roll)
+            write_appconf(client, config, store=False, wait_ack=wait_ack)
+            return "save"
+        if choice == "skip":
+            apply_roll_offset(config, restore.rot_roll * DEG_TO_RAD)
+            write_appconf(client, config, store=False, wait_ack=wait_ack)
+            return "skip"
+        if choice == "cancel":
+            return "cancel"
+
+
+def run_pitch_orientation(
+    client: VescClient,
+    config: dict[str, object],
+    restore: OrientationRestore,
+    *,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> StepChoice:
+    """Run the pitch orientation sub-step."""
+
+    while True:
+        wait_for_enter(
+            "Keep the IMU level on a flat stable surface for pitch calibration.",
+            assume_yes=assume_yes,
+        )
+        state = sample_filtered_imu(
+            client,
+            seconds=sample_seconds,
+            poll_hz=poll_hz,
+            status=lambda s: (
+                f"Pitch offset {(s.pitch * RAD_TO_DEG - restore.rot_pitch):+.3f} deg"
+            ),
+        )
+        print(
+            f"Measured pitch offset: {(state.pitch * RAD_TO_DEG - restore.rot_pitch):+.6f} deg"
+        )
+        choice = "save" if assume_yes else prompt_step()
+        if choice == "save":
+            apply_pitch_offset(config, state.pitch)
+            write_appconf(client, config, store=False, wait_ack=wait_ack)
+            return "save"
+        if choice == "skip":
+            apply_pitch_offset(config, restore.rot_pitch * DEG_TO_RAD)
+            write_appconf(client, config, store=False, wait_ack=wait_ack)
+            return "skip"
+        if choice == "cancel":
+            return "cancel"
+
+
+def run_yaw_orientation(
+    client: VescClient,
+    config: dict[str, object],
+    restore: OrientationRestore,
+    *,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> StepChoice:
+    """Run the yaw orientation sub-step."""
+
+    while True:
+        wait_for_enter(
+            "Raise pitch to roughly 45 degrees while keeping roll level for yaw calibration.",
+            assume_yes=assume_yes,
+        )
+        estimator = YawOffsetEstimator()
+
+        def status(_: FilteredImuState) -> str:
+            yaw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
+            return f"Yaw offset {yaw_offset:+.3f} deg"
+
+        sample_filtered_imu(
+            client,
+            seconds=sample_seconds,
+            poll_hz=poll_hz,
+            status=status,
+            yaw_estimator=estimator,
+        )
+        yaw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
+        print(f"Measured yaw offset: {yaw_offset:+.6f} deg")
+        choice = "save" if assume_yes else prompt_step()
+        if choice == "save":
+            apply_yaw_offset(config, -estimator.yaw_offset)
+            write_appconf(client, config, store=True, wait_ack=wait_ack)
+            return "save"
+        if choice == "skip":
+            apply_yaw_offset(config, restore.rot_yaw * DEG_TO_RAD)
+            write_appconf(client, config, store=True, wait_ack=wait_ack)
+            return "skip"
+        if choice == "cancel":
+            return "cancel"
+
+
+def run_orientation_step(
+    client: VescClient,
+    config: dict[str, object],
+    *,
+    assume_yes: bool,
+    poll_hz: float,
+    sample_seconds: float,
+    wait_ack: bool,
+) -> None:
+    """Run the orientation calibration step."""
+
+    print("\nStep 4/4: Orientation calibration")
+    restore = save_orientation_restore(config)
+    prepare_orientation_calibration(config)
+    write_appconf(client, config, store=False, wait_ack=wait_ack)
+
+    try:
+        for runner in (run_roll_orientation, run_pitch_orientation, run_yaw_orientation):
+            choice = runner(
+                client,
+                config,
+                restore,
+                assume_yes=assume_yes,
+                poll_hz=poll_hz,
+                sample_seconds=sample_seconds,
+                wait_ack=wait_ack,
+            )
+            if choice == "cancel":
+                restore_orientation_config(config, restore)
+                write_appconf(client, config, store=False, wait_ack=wait_ack)
+                print("Orientation calibration cancelled; previous values restored temporarily.")
+                return
+    except KeyboardInterrupt:
+        restore_orientation_config(config, restore)
+        write_appconf(client, config, store=False, wait_ack=wait_ack)
+        raise
+
+    print(
+        "Stored orientation calibration:\n"
+        f"  Roll:  {config_float(config, 'imu_conf.rot_roll'):+.6f} deg\n"
+        f"  Pitch: {config_float(config, 'imu_conf.rot_pitch'):+.6f} deg\n"
+        f"  Yaw:   {config_float(config, 'imu_conf.rot_yaw'):+.6f} deg"
+    )
+
+
+def validate_required_fields(config: dict[str, object]) -> None:
+    """Fail early if this firmware lacks the fields used by the wizard."""
+
+    required_names = [
+        "imu_conf.type",
+        "imu_conf.sample_rate_hz",
+        "imu_conf.mode",
+        "imu_conf.accel_confidence_decay",
+        "imu_conf.mahony_kp",
+        "imu_conf.accel_lowpass_filter_z",
+        "imu_conf.gyro_lowpass_filter",
+        "imu_conf.rot_roll",
+        "imu_conf.rot_pitch",
+        "imu_conf.rot_yaw",
+        "imu_conf.accel_offsets__0",
+        "imu_conf.accel_offsets__1",
+        "imu_conf.accel_offsets__2",
+        "imu_conf.gyro_offsets__0",
+        "imu_conf.gyro_offsets__1",
+        "imu_conf.gyro_offsets__2",
+    ]
+    missing = [name for name in required_names if name not in config]
+    if missing:
+        names = ", ".join(missing)
+        raise RuntimeError(f"APPCONF is missing required IMU setup fields: {names}")
+
+
+def run_wizard(client: VescClient, args: argparse.Namespace) -> None:
+    """Run all requested IMU setup steps."""
+
+    config = client.get_appconf()
+    validate_required_fields(config)
+
+    if not args.skip_basic:
+        run_basic_step(
+            client,
+            config,
+            profile_arg=args.profile,
+            search_arg=args.search_imu,
+            assume_yes=args.yes,
+            poll_hz=args.rate,
+            sample_seconds=args.search_seconds,
+            wait_ack=args.wait_ack,
+        )
+
+    if not args.skip_gyro:
+        run_gyro_step(
+            client,
+            config,
+            assume_yes=args.yes,
+            poll_hz=args.rate,
+            sample_seconds=args.sample_seconds,
+            wait_ack=args.wait_ack,
+        )
+
+    if not args.skip_accel:
+        run_accel_step(
+            client,
+            config,
+            assume_yes=args.yes,
+            poll_hz=args.rate,
+            sample_seconds=args.sample_seconds,
+            wait_ack=args.wait_ack,
+        )
+
+    if not args.skip_orientation:
+        run_orientation_step(
+            client,
+            config,
+            assume_yes=args.yes,
+            poll_hz=args.rate,
+            sample_seconds=args.sample_seconds,
+            wait_ack=args.wait_ack,
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the command-line parser."""
+
+    parser = argparse.ArgumentParser(
+        description="Run the VESC IMU setup wizard through a VESC Tool --tcpServer bridge.",
+        epilog=(
+            "Start VESC Tool first, for example: "
+            "vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102"
+        ),
+    )
+    parser.add_argument(
+        "--tcp",
+        type=parse_tcp_endpoint,
+        default=DEFAULT_TCP_ENDPOINT,
+        metavar="HOST:PORT",
+        help="VESC Tool TCP server endpoint (default: 127.0.0.1:65102).",
+    )
+    parser.add_argument(
+        "--scan-udp",
+        action="store_true",
+        help="Scan for VESC Tool TCP server UDP broadcasts and exit.",
+    )
+    parser.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=3.0,
+        metavar="SEC",
+        help="UDP scan duration in seconds (default: 3.0).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=1.0,
+        metavar="SEC",
+        help="VESC response timeout in seconds (default: 1.0).",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_POLL_HZ,
+        metavar="HZ",
+        help="IMU poll rate during calibration in Hz (default: 50).",
+    )
+    parser.add_argument(
+        "--sample-seconds",
+        type=float,
+        default=DEFAULT_SAMPLE_SECONDS,
+        metavar="SEC",
+        help="Sample duration for gyro/accel/orientation steps (default: 5.0).",
+    )
+    parser.add_argument(
+        "--search-seconds",
+        type=float,
+        default=DEFAULT_SEARCH_SECONDS,
+        metavar="SEC",
+        help="Sample duration for each IMU type during search (default: 2.0).",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=[profile.value for profile in ImuBasicProfile] + ["current"],
+        metavar="PROFILE",
+        help="Basic profile to apply without prompting.",
+    )
+    parser.add_argument(
+        "--search-imu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable IMU type search without prompting.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Use defaults and save each measured step without prompts.",
+    )
+    parser.add_argument(
+        "--wait-ack",
+        action="store_true",
+        help="Wait for APPCONF write acknowledgements.",
+    )
+    parser.add_argument("--skip-basic", action="store_true", help="Skip basic parameter setup.")
+    parser.add_argument("--skip-gyro", action="store_true", help="Skip gyro calibration.")
+    parser.add_argument("--skip-accel", action="store_true", help="Skip accelerometer calibration.")
+    parser.add_argument(
+        "--skip-orientation",
+        action="store_true",
+        help="Skip orientation calibration.",
+    )
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate numeric CLI arguments."""
+
+    if args.timeout <= 0.0:
+        raise SystemExit("--timeout must be greater than 0")
+    if args.rate <= 0.0:
+        raise SystemExit("--rate must be greater than 0")
+    if args.sample_seconds <= 0.0:
+        raise SystemExit("--sample-seconds must be greater than 0")
+    if args.search_seconds <= 0.0:
+        raise SystemExit("--search-seconds must be greater than 0")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Program entry point."""
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_args(args)
+
+    if args.scan_udp:
+        scan_and_print_udp(args.scan_timeout)
+        return
+
+    host, port = args.tcp
+    endpoint = f"{host}:{port}"
+    print(f"Connecting to VESC Tool TCP server at {endpoint} ...")
+    try:
+        client = VescClient.connect_tcp(host, port, timeout=args.timeout)
+    except ConnectionRefusedError:
+        raise SystemExit(tcp_server_help(endpoint, port)) from None
+    except ConnectionError as exc:
+        raise SystemExit(
+            f"{exc}\n\n"
+            "The TCP socket opened, but no VESC firmware response was received. "
+            "Make sure VESC Tool is connected to a controller before starting setup."
+        ) from None
+
+    try:
+        fw = client.fw_version
+        if fw is not None:
+            print(f"Firmware: {fw.major}.{fw.minor:02d}  HW: {fw.hw}")
+        run_wizard(client, args)
+        print("\nIMU setup finished.")
+    except KeyboardInterrupt:
+        print("\nStopped.", file=sys.stderr)
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    main()

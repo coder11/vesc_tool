@@ -99,6 +99,20 @@ The PyQtGraph live plot uses the VESC Tool `--tcpServer` bridge by default at
 `127.0.0.1:65102`. The `--mask` flag controls which IMU fields are requested
 (default `0x01ff` = roll/pitch/yaw + accelerometer + gyroscope).
 
+### IMU setup wizard
+
+```bash
+vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102
+python examples/imu_setup.py
+python examples/imu_setup.py --tcp 192.168.1.100:65102
+python examples/imu_setup.py --scan-udp
+```
+
+The setup wizard mirrors the VESC Tool IMU setup flow: basic IMU parameters,
+gyro offsets, accelerometer offsets, and orientation calibration. Use
+`--skip-basic`, `--skip-gyro`, `--skip-accel`, or `--skip-orientation` to run
+only part of the flow.
+
 ## Project structure
 
 ```
@@ -114,6 +128,7 @@ python/
     models.py              # Pydantic models (FwVersion, ImuValues, ...)
     fw_version.py          # COMM_FW_VERSION build/parse
     imu.py                 # COMM_GET_IMU_DATA build/parse
+    imu_setup.py           # IMU setup profiles and calibration math
     appconf.py             # APPCONF XML loading, signature, serialize/deserialize
     config_paths.py        # firmware version -> config XML resolution
     discovery.py           # UDP scan + serial port listing
@@ -121,6 +136,7 @@ python/
   tests/                   # unit tests (pytest, no hardware required)
   examples/
     imu_live_plot.py       # PyQtGraph live IMU plot
+    imu_setup.py           # Interactive IMU setup wizard
 ```
 
 ## Protocol notes
