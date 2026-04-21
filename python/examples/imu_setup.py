@@ -56,6 +56,7 @@ ProfileChoice = Literal["current", "default", "logs", "balance-unicycle", "balan
 StepChoice = Literal["save", "retry", "skip", "cancel"]
 STEP_PROMPT = "s/Enter=save  r=retry  k=skip  c=cancel"
 PostUpdateCallback = Callable[[float, FilteredImuState], None]
+StatusCallback = Callable[[FilteredImuState, FilteredImuState], str]
 
 
 @dataclass(frozen=True)
@@ -221,12 +222,49 @@ def write_appconf(
     client.set_appconf(config, store=store, wait_ack=wait_ack)
 
 
+def mean_label(mean_seconds: float) -> str:
+    """Return a short label for the displayed calibration value."""
+
+    if mean_seconds > 0.0:
+        return f"rolling {mean_seconds:g}s"
+    return "instant"
+
+
+class StatusBlockRenderer:
+    """Refresh a terminal status block without leaving stale lines behind."""
+
+    def __init__(self, *, include_prompt: bool) -> None:
+        self._include_prompt = include_prompt
+        self._line_count = 0
+        self._use_ansi = sys.stdout.isatty()
+
+    def render(self, block: str) -> None:
+        """Render a status block."""
+
+        text = f"{block}\n{STEP_PROMPT}" if self._include_prompt else block
+        if self._use_ansi:
+            if self._line_count > 1:
+                print(f"\033[{self._line_count - 1}F\r\033[J", end="")
+            elif self._line_count == 1:
+                print("\r\033[J", end="")
+            print(text, end="", flush=True)
+            self._line_count = text.count("\n") + 1
+        else:
+            print(text, flush=True)
+
+    def finish(self) -> None:
+        """Move to the next line after a terminal status block."""
+
+        if self._use_ansi and self._line_count:
+            print()
+
+
 def sample_filtered_imu(
     client: VescClient,
     *,
     seconds: float,
     poll_hz: float,
-    status: Callable[[FilteredImuState], str] | None = None,
+    status: StatusCallback | None = None,
     yaw_estimator: YawOffsetEstimator | None = None,
     mean_seconds: float = 0.0,
     post_update: PostUpdateCallback | None = None,
@@ -241,6 +279,7 @@ def sample_filtered_imu(
     end_time = time.monotonic() + seconds
     next_poll = time.monotonic()
     next_status = 0.0
+    status_renderer = StatusBlockRenderer(include_prompt=False) if status is not None else None
 
     while time.monotonic() < end_time:
         values = client.get_imu_data(IMU_SETUP_MASK)
@@ -253,7 +292,8 @@ def sample_filtered_imu(
             post_update(now, state)
         display_state = mean_window.update(now, state) if mean_window is not None else state
         if status is not None and now >= next_status:
-            print(f"\r{status(display_state)}", end="", flush=True)
+            assert status_renderer is not None
+            status_renderer.render(status(state, display_state))
             next_status = now + 0.25
 
         next_poll += period
@@ -263,8 +303,8 @@ def sample_filtered_imu(
         else:
             next_poll = time.monotonic()
 
-    if status is not None:
-        print()
+    if status_renderer is not None:
+        status_renderer.finish()
     return display_state
 
 
@@ -272,7 +312,7 @@ def sample_filtered_imu_until_step_choice(
     client: VescClient,
     *,
     poll_hz: float,
-    status: Callable[[FilteredImuState], str],
+    status: StatusCallback,
     yaw_estimator: YawOffsetEstimator | None = None,
     mean_seconds: float = 0.0,
     post_update: PostUpdateCallback | None = None,
@@ -298,19 +338,12 @@ def sample_filtered_imu_until_step_choice(
     period = 1.0 / poll_hz
     next_poll = time.monotonic()
     next_status = 0.0
-    last_line_len = 0
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-
-    def render_status() -> None:
-        nonlocal last_line_len
-        line = f"{status(display_state)} | {STEP_PROMPT}"
-        padding = " " * max(0, last_line_len - len(line))
-        print(f"\r{line}{padding}", end="", flush=True)
-        last_line_len = len(line)
+    status_renderer = StatusBlockRenderer(include_prompt=True)
 
     mean_note = f"{mean_seconds:g}s rolling mean" if mean_seconds > 0.0 else "instant value"
-    print(f"Sampling {mean_note} until action ({STEP_PROMPT})")
+    print(f"Sampling {mean_note} until action {STEP_PROMPT}")
     try:
         tty.setcbreak(fd)
         while True:
@@ -324,7 +357,7 @@ def sample_filtered_imu_until_step_choice(
                 post_update(now, state)
             display_state = mean_window.update(now, state) if mean_window is not None else state
             if now >= next_status:
-                render_status()
+                status_renderer.render(status(state, display_state))
                 next_status = now + 0.25
 
             ready, _, _ = select.select([sys.stdin], [], [], 0.0)
@@ -332,11 +365,12 @@ def sample_filtered_imu_until_step_choice(
                 char = sys.stdin.read(1)
                 choice = parse_step_choice(char, default="save")
                 if choice is not None:
-                    print()
+                    status_renderer.finish()
                     return display_state, choice
-                print(f"\nUnknown action {char!r}. Use {STEP_PROMPT}.")
-                last_line_len = 0
-                render_status()
+                status_renderer.finish()
+                print(f"Unknown action {char!r}. Use {STEP_PROMPT}.")
+                status_renderer = StatusBlockRenderer(include_prompt=True)
+                status_renderer.render(status(state, display_state))
 
             next_poll += period
             sleep_s = max(0.0, next_poll - time.monotonic())
@@ -387,7 +421,11 @@ def search_imu_type(
         set_config_int(config, "imu_conf.type", imu_type)
         write_appconf(client, config, store=False, wait_ack=wait_ack)
 
-        def status(state: FilteredImuState, name: str = imu_type_name(imu_type)) -> str:
+        def status(
+            state: FilteredImuState,
+            _: FilteredImuState,
+            name: str = imu_type_name(imu_type),
+        ) -> str:
             return f"Testing {name}: gyro noise {state.gyro_x_noise:.4f}"
 
         state = sample_filtered_imu(
@@ -483,10 +521,12 @@ def run_gyro_step(
             "Leave the IMU stable in any orientation without vibration.",
             assume_yes=assume_yes,
         )
-        def gyro_status(state: FilteredImuState) -> str:
+        def gyro_status(raw: FilteredImuState, mean: FilteredImuState) -> str:
             return (
-                f"Gyro offsets X {state.gyro_x:+.3f}  "
-                f"Y {state.gyro_y:+.3f}  Z {state.gyro_z:+.3f}"
+                "Gyro offsets (instant):\n"
+                f"X {raw.gyro_x:+.3f}  Y {raw.gyro_y:+.3f}  Z {raw.gyro_z:+.3f}\n"
+                f"Gyro offsets ({mean_label(mean_seconds)}):\n"
+                f"X {mean.gyro_x:+.3f}  Y {mean.gyro_y:+.3f}  Z {mean.gyro_z:+.3f}"
             )
         if assume_yes:
             state = sample_filtered_imu(
@@ -512,6 +552,7 @@ def run_gyro_step(
             save_gyro_offsets(config, state)
             write_appconf(client, config, store=True, wait_ack=wait_ack)
             print("Stored gyroscope offsets.")
+            print()
             return
         if choice == "skip":
             print("Skipped gyroscope calibration.")
@@ -565,10 +606,18 @@ def run_accel_step(
                 assume_yes=assume_yes,
             )
 
-            def status(state: FilteredImuState, current_axis: str = axis) -> str:
+            def status(
+                raw: FilteredImuState,
+                mean: FilteredImuState,
+                current_axis: str = axis,
+            ) -> str:
                 return (
-                    f"{current_axis.upper()} {axis_current(state, current_axis):+.3f}  "
-                    f"Max {axis_max(state, current_axis):+.3f}"
+                    f"Accel {current_axis.upper()} (instant):\n"
+                    f"{current_axis.upper()} {axis_current(raw, current_axis):+.3f}  "
+                    f"Max {axis_max(raw, current_axis):+.3f}\n"
+                    f"Accel {current_axis.upper()} ({mean_label(mean_seconds)}):\n"
+                    f"{current_axis.upper()} {axis_current(mean, current_axis):+.3f}  "
+                    f"Max {axis_max(mean, current_axis):+.3f}"
                 )
 
             if assume_yes:
@@ -593,6 +642,7 @@ def run_accel_step(
                 save_accel_offset(config, axis, max_value)
                 write_appconf(client, config, store=True, wait_ack=wait_ack)
                 print(f"Stored accelerometer {axis.upper()} offset.")
+                print()
                 break
             if choice == "skip":
                 print(f"Skipped accelerometer {axis.upper()} calibration.")
@@ -650,8 +700,15 @@ def run_roll_orientation(
             "Place the IMU level on a flat stable surface for roll calibration.",
             assume_yes=assume_yes,
         )
-        def roll_status(state: FilteredImuState) -> str:
-            return f"Roll offset {(-state.roll * RAD_TO_DEG - restore.rot_roll):+.3f} deg"
+        def roll_status(raw: FilteredImuState, mean: FilteredImuState) -> str:
+            raw_offset = -raw.roll * RAD_TO_DEG - restore.rot_roll
+            mean_offset = -mean.roll * RAD_TO_DEG - restore.rot_roll
+            return (
+                "Roll offset (instant):\n"
+                f"{raw_offset:+.3f} deg\n"
+                f"Roll offset ({mean_label(mean_seconds)}):\n"
+                f"{mean_offset:+.3f} deg"
+            )
         if assume_yes:
             state = sample_filtered_imu(
                 client,
@@ -699,9 +756,14 @@ def run_pitch_orientation(
             "Keep the IMU level on a flat stable surface for pitch calibration.",
             assume_yes=assume_yes,
         )
-        def pitch_status(state: FilteredImuState) -> str:
+        def pitch_status(raw: FilteredImuState, mean: FilteredImuState) -> str:
+            raw_offset = raw.pitch * RAD_TO_DEG - restore.rot_pitch
+            mean_offset = mean.pitch * RAD_TO_DEG - restore.rot_pitch
             return (
-                f"Pitch offset {(state.pitch * RAD_TO_DEG - restore.rot_pitch):+.3f} deg"
+                "Pitch offset (instant):\n"
+                f"{raw_offset:+.3f} deg\n"
+                f"Pitch offset ({mean_label(mean_seconds)}):\n"
+                f"{mean_offset:+.3f} deg"
             )
         if assume_yes:
             state = sample_filtered_imu(
@@ -765,9 +827,15 @@ def run_yaw_orientation(
                 return yaw_mean.value
             return estimator.yaw_offset
 
-        def status(_: FilteredImuState) -> str:
-            yaw_offset = -current_yaw_offset() * RAD_TO_DEG - restore.rot_yaw
-            return f"Yaw offset {yaw_offset:+.3f} deg"
+        def status(_: FilteredImuState, __: FilteredImuState) -> str:
+            raw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
+            mean_offset = -current_yaw_offset() * RAD_TO_DEG - restore.rot_yaw
+            return (
+                "Yaw offset (instant):\n"
+                f"{raw_offset:+.3f} deg\n"
+                f"Yaw offset ({mean_label(mean_seconds)}):\n"
+                f"{mean_offset:+.3f} deg"
+            )
 
         if assume_yes:
             sample_filtered_imu(
