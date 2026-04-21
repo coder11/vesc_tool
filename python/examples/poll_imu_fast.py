@@ -27,12 +27,15 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 import serial  # type: ignore[import-untyped]
 
 from vesc_py import list_serial_ports
+from vesc_py.client import Transport, VescClient
 from vesc_py.comm_ids import CommPacketId
+from vesc_py.config_schema import CfgType, ConfigParam, ConfigSchema
 from vesc_py.crc import crc16
 from vesc_py.packet import MAX_PACKET_LEN, encode_packet
 
@@ -51,6 +54,10 @@ DEFAULT_FFT_WINDOW = 2.0
 DEFAULT_PLOT_HISTORY = 20000
 DEFAULT_PLOT_MAX_POINTS = 1200
 DEFAULT_PLOT_PENDING = 20000
+DEFAULT_APPCONF_TIMEOUT = 1.0
+DEFAULT_APPCONF_FW_RETRIES = 25
+APPCONF_LIVE_APPLY_DELAY_MS = 200
+APPCONF_NON_LIVE_PARAMS = frozenset({"imu_conf.filter"})
 PLOT_SAMPLE_BATCH = 64
 PLOT_SAMPLE_BATCH_NS = 5_000_000
 DEFAULT_PIPELINE_DEPTH = 1
@@ -567,6 +574,93 @@ def open_serial(
     serial_port = cast(SerialLike, raw_serial)
     serial_port.reset_input_buffer()
     return serial_port
+
+
+class SharedSerialTransport(Transport):
+    """VescClient transport that reuses the already-open fast-poller serial port."""
+
+    def __init__(self, serial_port: SerialLike) -> None:
+        self._serial_port = serial_port
+
+    def send(self, data: bytes) -> None:
+        self._serial_port.write(data)
+
+    def recv(self, timeout: float) -> bytes:
+        self._serial_port.timeout = timeout
+        return self._serial_port.read(4096)
+
+    def close(self) -> None:
+        """Leave ownership of the serial port with the fast poller."""
+        return None
+
+
+class PlotAppConfigClient:
+    """Small locked APPCONF client for plot-mode live IMU config edits."""
+
+    def __init__(self, client: VescClient, command_lock: Any) -> None:
+        self._client = client
+        self._command_lock = command_lock
+
+    @classmethod
+    def connect(
+        cls,
+        serial_port: SerialLike,
+        *,
+        command_lock: Any,
+        timeout: float,
+        fw_retries: int,
+        config_dir: Path | None = None,
+    ) -> PlotAppConfigClient:
+        transport = SharedSerialTransport(serial_port)
+        client = VescClient(
+            transport,
+            timeout=timeout,
+            fw_retries=fw_retries,
+            config_dir=config_dir,
+        )
+        with command_lock:
+            client._handshake()
+
+        if client.appconf_schema is None:
+            raise RuntimeError(
+                "No APPCONF schema loaded for this firmware version; "
+                "cannot edit IMU app config."
+            )
+        return cls(client, command_lock)
+
+    @property
+    def schema(self) -> ConfigSchema:
+        schema = self._client.appconf_schema
+        if schema is None:
+            raise RuntimeError("No APPCONF schema loaded")
+        return schema
+
+    @property
+    def firmware_label(self) -> str:
+        fw = self._client.fw_version
+        if fw is None:
+            return "Firmware: unknown"
+        name = f" {fw.fw_name}" if fw.fw_name else ""
+        hw = f"  HW: {fw.hw}" if fw.hw else ""
+        return f"Firmware: {fw.major}.{fw.minor:02d}{name}{hw}"
+
+    def get_appconf(self) -> dict[str, object]:
+        with self._command_lock:
+            return self._client.get_appconf()
+
+    def set_appconf(
+        self,
+        config: dict[str, object],
+        *,
+        store: bool,
+        wait_ack: bool,
+    ) -> None:
+        with self._command_lock:
+            self._client.set_appconf(config, store=store, wait_ack=wait_ack)
+
+    def close(self) -> None:
+        with self._command_lock:
+            self._client.close()
 
 
 def autodetect_port() -> str:
@@ -1190,6 +1284,7 @@ class FastImuAxisPoller:
         max_samples: int,
         pipeline_depth: int,
         pending_samples: int,
+        command_lock: Any | None = None,
     ) -> None:
         value_index = field_value_index(mask, field_name)
         if value_index is None:
@@ -1204,6 +1299,7 @@ class FastImuAxisPoller:
         self._duration = duration
         self._max_samples = max_samples
         self._pipeline_depth = pipeline_depth
+        self._command_lock = command_lock or threading.RLock()
         self._samples = AxisSampleBuffer(pending_samples)
         self._reader_stats = ReaderStats()
         self._poll_stats = PollStats()
@@ -1296,22 +1392,23 @@ class FastImuAxisPoller:
                 duration=self._duration,
                 max_samples=self._max_samples,
             ):
-                while outstanding < self._pipeline_depth and not self._stop.is_set():
-                    self._serial_port.write(self._request)
-                    self._poll_stats.requests += 1
-                    outstanding += 1
+                with self._command_lock:
+                    while outstanding < self._pipeline_depth and not self._stop.is_set():
+                        self._serial_port.write(self._request)
+                        self._poll_stats.requests += 1
+                        outstanding += 1
 
-                payload = read_expected_imu_packet(
-                    self._serial_port,
-                    self._packet_timeout,
-                    self._reader_stats,
-                )
-                now_ns = time.perf_counter_ns()
-                if payload is None:
-                    self._poll_stats.timeouts += 1
-                    outstanding = 0
-                    self._serial_port.reset_input_buffer()
-                    continue
+                    payload = read_expected_imu_packet(
+                        self._serial_port,
+                        self._packet_timeout,
+                        self._reader_stats,
+                    )
+                    now_ns = time.perf_counter_ns()
+                    if payload is None:
+                        self._poll_stats.timeouts += 1
+                        outstanding = 0
+                        self._serial_port.reset_input_buffer()
+                        continue
 
                 outstanding = max(0, outstanding - 1)
                 self._poll_stats.samples += 1
@@ -1350,6 +1447,7 @@ class FastImuPlotPoller:
         max_samples: int,
         pipeline_depth: int,
         pending_samples: int,
+        command_lock: Any | None = None,
     ) -> None:
         missing_fields = [
             field_name
@@ -1371,6 +1469,7 @@ class FastImuPlotPoller:
         self._duration = duration
         self._max_samples = max_samples
         self._pipeline_depth = pipeline_depth
+        self._command_lock = command_lock or threading.RLock()
         self._samples = ImuSampleBuffer(pending_samples)
         self._reader_stats = ReaderStats()
         self._poll_stats = PollStats()
@@ -1481,22 +1580,23 @@ class FastImuPlotPoller:
                 duration=self._duration,
                 max_samples=self._max_samples,
             ):
-                while outstanding < self._pipeline_depth and not self._stop.is_set():
-                    self._serial_port.write(self._request)
-                    self._poll_stats.requests += 1
-                    outstanding += 1
+                with self._command_lock:
+                    while outstanding < self._pipeline_depth and not self._stop.is_set():
+                        self._serial_port.write(self._request)
+                        self._poll_stats.requests += 1
+                        outstanding += 1
 
-                payload = read_expected_imu_packet(
-                    self._serial_port,
-                    self._packet_timeout,
-                    self._reader_stats,
-                )
-                now_ns = time.perf_counter_ns()
-                if payload is None:
-                    self._poll_stats.timeouts += 1
-                    outstanding = 0
-                    self._serial_port.reset_input_buffer()
-                    continue
+                    payload = read_expected_imu_packet(
+                        self._serial_port,
+                        self._packet_timeout,
+                        self._reader_stats,
+                    )
+                    now_ns = time.perf_counter_ns()
+                    if payload is None:
+                        self._poll_stats.timeouts += 1
+                        outstanding = 0
+                        self._serial_port.reset_input_buffer()
+                        continue
 
                 outstanding = max(0, outstanding - 1)
                 self._poll_stats.samples += 1
@@ -1567,6 +1667,371 @@ def require_qt_platform_runtime() -> None:
         )
 
 
+def imu_general_param_names(schema: ConfigSchema) -> list[str]:
+    """Return the same IMU/general app-config rows used by PageAppImu."""
+    for group in schema.groups:
+        if group.name.casefold() != "imu":
+            continue
+        for subgroup in group.subgroups:
+            if subgroup.name.casefold() == "general":
+                return list(subgroup.items)
+
+    return [name for name in schema.ser_order if name.startswith("imu_conf.")]
+
+
+def _set_item_read_only(item: Any, qt_core: Any) -> None:
+    item_flag = getattr(qt_core.Qt, "ItemFlag", qt_core.Qt)
+    item.setFlags(item.flags() & ~item_flag.ItemIsEditable)
+
+
+def _enum_label(name: str) -> str:
+    for prefix in (
+        "IMU_TYPE_",
+        "IMU_FILTER_",
+        "IMU_MODE_",
+        "AHRS_MODE_",
+    ):
+        if name.startswith(prefix):
+            return name[len(prefix) :].replace("_", " ").title()
+    return name.replace("_", " ").title()
+
+
+def _object_as_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(cast(Any, value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _object_as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(cast(Any, value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _editor_scale(param: ConfigParam) -> float:
+    return param.editor_scale if param.editor_scale != 0.0 else 1.0
+
+
+class ImuAppConfigPanel:
+    """Qt table of live IMU APPCONF editors matching the PageAppImu subgroup."""
+
+    def __init__(
+        self,
+        qt_core: Any,
+        qt_widgets: Any,
+        client: PlotAppConfigClient,
+        *,
+        title_color: str,
+        status_color: str,
+    ) -> None:
+        self._qt_core = qt_core
+        self._qt_widgets = qt_widgets
+        self._client = client
+        self._schema = client.schema
+        self._config: dict[str, object] = {}
+        self._live_config: dict[str, object] = {}
+        self._controls: dict[str, Any] = {}
+        self._loading = False
+
+        self.widget = qt_widgets.QGroupBox("IMU App Config")
+        self.widget.setMinimumWidth(390)
+        self.widget.setMaximumWidth(520)
+        self.widget.setStyleSheet(f"QGroupBox {{ color: {title_color}; font-weight: 700; }}")
+        layout = qt_widgets.QVBoxLayout(self.widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        firmware = qt_widgets.QLabel(client.firmware_label)
+        firmware.setStyleSheet(f"color: {status_color}; font-weight: 400;")
+        firmware.setWordWrap(True)
+        layout.addWidget(firmware)
+
+        self._table = qt_widgets.QTableWidget()
+        self._setup_table()
+        layout.addWidget(self._table, stretch=1)
+
+        button_row = qt_widgets.QHBoxLayout()
+        self._reload_button = qt_widgets.QPushButton("Reload")
+        self._store_button = qt_widgets.QPushButton("Store")
+        button_row.addWidget(self._reload_button)
+        button_row.addWidget(self._store_button)
+        layout.addLayout(button_row)
+
+        self._status = qt_widgets.QLabel("Loading app config...")
+        self._status.setStyleSheet(f"color: {status_color}; font-weight: 400;")
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
+
+        self._apply_timer = qt_core.QTimer()
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.setInterval(APPCONF_LIVE_APPLY_DELAY_MS)
+        self._apply_timer.timeout.connect(self._apply_live)
+        self._reload_button.clicked.connect(self.reload)
+        self._store_button.clicked.connect(self.store)
+
+        self.reload()
+
+    def _setup_table(self) -> None:
+        self._table.setColumnCount(2)
+        self._table.setHorizontalHeaderLabels(("Name", "Edit"))
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setVisible(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setShowGrid(False)
+        self._table.setAlternatingRowColors(True)
+
+        abstract_item_view = self._qt_widgets.QAbstractItemView
+        selection_behavior = getattr(
+            getattr(abstract_item_view, "SelectionBehavior", abstract_item_view),
+            "SelectRows",
+        )
+        selection_mode = getattr(
+            getattr(abstract_item_view, "SelectionMode", abstract_item_view),
+            "NoSelection",
+        )
+        self._table.setSelectionBehavior(selection_behavior)
+        self._table.setSelectionMode(selection_mode)
+
+    def reload(self) -> None:
+        try:
+            config = self._client.get_appconf()
+        except Exception as exc:  # noqa: BLE001 - user-visible hardware error path.
+            self._set_status(f"Reload failed: {exc}")
+            return
+
+        self._loading = True
+        try:
+            self._config = config
+            self._live_config = dict(config)
+            self._controls.clear()
+            self._table.setRowCount(0)
+            for name in imu_general_param_names(self._schema):
+                if name.startswith("::sep::"):
+                    self._add_separator(name[7:])
+                    continue
+                param = self._schema.params.get(name)
+                if param is not None and param.type != CfgType.UNDEFINED:
+                    self._add_param_row(name, param, config.get(name))
+            self._table.resizeColumnToContents(0)
+            self._table.resizeRowsToContents()
+        finally:
+            self._loading = False
+
+        self._set_status("Live edits apply temporarily; Store writes to flash.")
+
+    def store(self) -> None:
+        self._apply_timer.stop()
+        try:
+            self._client.set_appconf(self._config, store=True, wait_ack=True)
+        except Exception as exc:  # noqa: BLE001 - user-visible hardware error path.
+            self._set_status(f"Store failed: {exc}")
+            return
+        self._live_config = dict(self._config)
+        self._set_status("Stored app config.")
+
+    def _add_separator(self, text: str) -> None:
+        row = self._table.rowCount()
+        self._table.setRowCount(row + 1)
+        label = self._qt_widgets.QLabel(text)
+        alignment = getattr(self._qt_core.Qt, "AlignmentFlag", self._qt_core.Qt)
+        label.setAlignment(alignment.AlignCenter)
+        label.setStyleSheet("font-weight: 700; padding: 3px;")
+        self._table.setCellWidget(row, 0, label)
+        self._table.setSpan(row, 0, 1, 2)
+
+    def _add_param_row(self, name: str, param: ConfigParam, value: object) -> None:
+        row = self._table.rowCount()
+        self._table.setRowCount(row + 1)
+
+        label = self._qt_widgets.QTableWidgetItem(param.long_name or name)
+        if param.description_text:
+            label.setToolTip(param.description_text)
+        _set_item_read_only(label, self._qt_core)
+        self._table.setItem(row, 0, label)
+
+        editor = self._make_editor(name, param, value)
+        if param.description_text:
+            editor.setToolTip(param.description_text)
+        self._controls[name] = editor
+        self._table.setCellWidget(row, 1, editor)
+
+    def _make_editor(self, name: str, param: ConfigParam, value: object) -> Any:
+        if param.type == CfgType.DOUBLE:
+            editor = self._qt_widgets.QDoubleSpinBox()
+            editor.setKeyboardTracking(False)
+            editor.setDecimals(max(0, min(param.decimals_double, 9)))
+            editor.setRange(
+                self._display_double(param, param.min_double),
+                self._display_double(param, param.max_double),
+            )
+            editor.setSingleStep(param.step_double if param.step_double > 0.0 else 0.1)
+            if param.suffix:
+                editor.setSuffix(param.suffix)
+            editor.setValue(self._display_double(param, _object_as_float(value)))
+            editor.valueChanged.connect(
+                lambda _value, n=name, p=param, w=editor: self._control_changed(
+                    n,
+                    self._double_config_value(p, float(w.value())),
+                )
+            )
+            return editor
+
+        if param.type in (CfgType.INT, CfgType.BITFIELD):
+            editor = self._qt_widgets.QSpinBox()
+            editor.setKeyboardTracking(False)
+            editor.setRange(
+                self._display_int(param, param.min_int),
+                self._display_int(param, param.max_int),
+            )
+            editor.setSingleStep(param.step_int if param.step_int > 0 else 1)
+            if param.suffix:
+                editor.setSuffix(param.suffix)
+            editor.setValue(self._display_int(param, _object_as_int(value)))
+            editor.valueChanged.connect(
+                lambda _value, n=name, p=param, w=editor: self._control_changed(
+                    n,
+                    self._int_config_value(p, int(w.value())),
+                )
+            )
+            return editor
+
+        if param.type == CfgType.ENUM:
+            if name in APPCONF_NON_LIVE_PARAMS:
+                return self._make_radio_enum_editor(name, param, value)
+
+            editor = self._qt_widgets.QComboBox()
+            editor.addItems([_enum_label(item) for item in param.enum_names])
+            current = _object_as_int(value)
+            if 0 <= current < len(param.enum_names):
+                editor.setCurrentIndex(current)
+            editor.activated.connect(
+                lambda _index, n=name, w=editor: self._control_changed(
+                    n,
+                    int(w.currentIndex()),
+                )
+            )
+            return editor
+
+        if param.type == CfgType.BOOL:
+            editor = self._qt_widgets.QCheckBox()
+            editor.setChecked(bool(_object_as_int(value)))
+            editor.stateChanged.connect(
+                lambda _state, n=name, w=editor: self._control_changed(
+                    n,
+                    1 if w.isChecked() else 0,
+                )
+            )
+            return editor
+
+        editor = self._qt_widgets.QLineEdit(str(value or ""))
+        if param.max_len > 0:
+            editor.setMaxLength(param.max_len)
+        editor.editingFinished.connect(
+            lambda n=name, w=editor: self._control_changed(n, w.text())
+        )
+        return editor
+
+    def _make_radio_enum_editor(
+        self,
+        name: str,
+        param: ConfigParam,
+        value: object,
+    ) -> Any:
+        editor = self._qt_widgets.QWidget()
+        layout = self._qt_widgets.QHBoxLayout(editor)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        current = _object_as_int(value)
+        for index, enum_name in enumerate(param.enum_names):
+            button = self._qt_widgets.QRadioButton(_enum_label(enum_name))
+            button.setChecked(index == current)
+            button.toggled.connect(
+                lambda checked, n=name, i=index: (
+                    self._control_changed(n, i) if checked else None
+                )
+            )
+            layout.addWidget(button)
+
+        layout.addStretch(1)
+        return editor
+
+    def _control_changed(self, name: str, value: object) -> None:
+        try:
+            if self._loading:
+                return
+            self._config[name] = value
+            if name in APPCONF_NON_LIVE_PARAMS:
+                self._set_status(f"{name} changed locally; live apply skipped.")
+                return
+            self._live_config[name] = value
+            self._set_status(f"Pending live apply: {name}")
+            self._apply_timer.start()
+        except Exception as exc:  # noqa: BLE001 - keep Qt signal exceptions local.
+            self._set_status(f"Edit failed for {name}: {exc}")
+
+    def _apply_live(self) -> None:
+        try:
+            self._client.set_appconf(self._live_config, store=False, wait_ack=False)
+        except Exception as exc:  # noqa: BLE001 - user-visible hardware error path.
+            self._set_status(f"Live apply failed: {exc}")
+            return
+        self._set_status("Applied temporary app config.")
+
+    def _set_status(self, text: str) -> None:
+        self._status.setText(text)
+
+    @staticmethod
+    def _display_double(param: ConfigParam, value: float) -> float:
+        if param.edit_as_percentage:
+            max_value = max(abs(param.max_double), abs(param.min_double), 1e-12)
+            return (value * 100.0) / max_value
+        return value * _editor_scale(param)
+
+    @staticmethod
+    def _double_config_value(param: ConfigParam, display_value: float) -> float:
+        if param.edit_as_percentage:
+            max_value = max(abs(param.max_double), abs(param.min_double), 1e-12)
+            return (display_value / 100.0) * max_value
+        return display_value / _editor_scale(param)
+
+    @staticmethod
+    def _display_int(param: ConfigParam, value: int) -> int:
+        if param.edit_as_percentage:
+            max_value = max(abs(param.max_int), abs(param.min_int), 1)
+            return round((value * 100) / max_value)
+        return round(value * _editor_scale(param))
+
+    @staticmethod
+    def _int_config_value(param: ConfigParam, display_value: int) -> int:
+        if param.edit_as_percentage:
+            max_value = max(abs(param.max_int), abs(param.min_int), 1)
+            return round((display_value * max_value) / 100)
+        return round(display_value / _editor_scale(param))
+
+
+def make_app_config_error_panel(
+    qt_widgets: Any,
+    *,
+    error: str,
+    title_color: str,
+    status_color: str,
+) -> Any:
+    group = qt_widgets.QGroupBox("IMU App Config")
+    group.setMinimumWidth(390)
+    group.setMaximumWidth(520)
+    group.setStyleSheet(f"QGroupBox {{ color: {title_color}; font-weight: 700; }}")
+    layout = qt_widgets.QVBoxLayout(group)
+    label = qt_widgets.QLabel(f"App config controls unavailable: {error}")
+    label.setWordWrap(True)
+    label.setStyleSheet(f"color: {status_color}; font-weight: 400;")
+    layout.addWidget(label)
+    layout.addStretch(1)
+    return group
+
+
 def run_fast_imu_grid_plot(
     poller: FastImuPlotPoller,
     *,
@@ -1577,6 +2042,8 @@ def run_fast_imu_grid_plot(
     fft_rate: float,
     theme: str,
     antialias: bool,
+    app_config_client: PlotAppConfigClient | None = None,
+    app_config_error: str | None = None,
 ) -> None:
     """Run the fast direct-USB 2x3 IMU plot grid."""
     selected_theme = PLOT_THEMES[theme]
@@ -1596,6 +2063,32 @@ def run_fast_imu_grid_plot(
     window.setStyleSheet(f"background-color: {selected_theme.window_background};")
 
     qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
+    root_layout = QtWidgets.QHBoxLayout(window)
+    root_layout.setContentsMargins(0, 0, 0, 0)
+    root_layout.setSpacing(8)
+    if app_config_client is not None:
+        config_panel = ImuAppConfigPanel(
+            QtCore,
+            QtWidgets,
+            app_config_client,
+            title_color=selected_theme.title_color,
+            status_color=selected_theme.status_color,
+        )
+        root_layout.addWidget(config_panel.widget, stretch=0)
+    elif app_config_error is not None:
+        root_layout.addWidget(
+            make_app_config_error_panel(
+                QtWidgets,
+                error=app_config_error,
+                title_color=selected_theme.title_color,
+                status_color=selected_theme.status_color,
+            ),
+            stretch=0,
+        )
+
+    plot_area = QtWidgets.QWidget()
+    root_layout.addWidget(plot_area, stretch=1)
+
     title = QtWidgets.QLabel("VESC Fast IMU Data")
     title.setAlignment(qt_alignment.AlignCenter)
     title.setStyleSheet(
@@ -1604,7 +2097,7 @@ def run_fast_imu_grid_plot(
     status = QtWidgets.QLabel("Waiting for IMU data...")
     status.setStyleSheet(f"color: {selected_theme.status_color};")
 
-    layout = QtWidgets.QGridLayout(window)
+    layout = QtWidgets.QGridLayout(plot_area)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(8)
     layout.addWidget(title, 0, 0, 1, 2)
@@ -2443,6 +2936,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable PyQtGraph antialiasing in --plot mode. Disabled by default for speed.",
     )
     parser.add_argument(
+        "--no-app-config-controls",
+        action="store_true",
+        help="Disable the live IMU app-config controls in --plot mode.",
+    )
+    parser.add_argument(
+        "--app-config-timeout",
+        type=float,
+        default=DEFAULT_APPCONF_TIMEOUT,
+        metavar="SEC",
+        help=(
+            "Timeout for plot-mode app-config reads/writes "
+            f"(default: {DEFAULT_APPCONF_TIMEOUT:g})."
+        ),
+    )
+    parser.add_argument(
+        "--app-config-fw-retries",
+        type=int,
+        default=DEFAULT_APPCONF_FW_RETRIES,
+        metavar="N",
+        help=(
+            "Firmware-version retries before disabling plot-mode app-config controls "
+            f"(default: {DEFAULT_APPCONF_FW_RETRIES})."
+        ),
+    )
+    parser.add_argument(
         "--print-every",
         type=int,
         default=0,
@@ -2502,6 +3020,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--fft-rate must be greater than 0")
     if args.plot_pending <= 0:
         parser.error("--plot-pending must be greater than 0")
+    if args.app_config_timeout <= 0.0:
+        parser.error("--app-config-timeout must be greater than 0")
+    if args.app_config_fw_retries <= 0:
+        parser.error("--app-config-fw-retries must be greater than 0")
     if args.print_every < 0:
         parser.error("--print-every must be greater than or equal to 0")
     if args.pipeline_depth <= 0:
@@ -2561,8 +3083,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.timeout,
         exclusive=not args.no_exclusive,
     )
+    command_lock = threading.RLock()
+    app_config_client: PlotAppConfigClient | None = None
+    app_config_error: str | None = None
     try:
         if args.plot:
+            if not args.no_app_config_controls:
+                try:
+                    app_config_client = PlotAppConfigClient.connect(
+                        serial_port,
+                        command_lock=command_lock,
+                        timeout=args.app_config_timeout,
+                        fw_retries=args.app_config_fw_retries,
+                    )
+                except Exception as exc:  # noqa: BLE001 - keep plotting if config fails.
+                    app_config_error = str(exc)
+                    print(
+                        f"IMU app-config controls disabled: {app_config_error}",
+                        file=sys.stderr,
+                    )
+
             plot_poller = FastImuPlotPoller(
                 serial_port,
                 request=request,
@@ -2572,6 +3112,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 max_samples=args.max_samples,
                 pipeline_depth=args.pipeline_depth,
                 pending_samples=args.plot_pending,
+                command_lock=command_lock,
             )
             run_fast_imu_grid_plot(
                 plot_poller,
@@ -2582,6 +3123,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 fft_rate=args.fft_rate,
                 theme=args.theme,
                 antialias=args.antialias,
+                app_config_client=app_config_client,
+                app_config_error=app_config_error,
             )
         else:
             poll_imu(
@@ -2599,6 +3142,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 tui=tui,
             )
     finally:
+        if app_config_client is not None:
+            app_config_client.close()
         serial_port.close()
 
 
