@@ -10,13 +10,16 @@ Usage:
     python examples/imu_setup.py --scan-udp
 """
 
-# pylint: disable=too-many-arguments,too-many-instance-attributes
+# pylint: disable=too-many-arguments,too-many-instance-attributes,too-many-lines
 
 from __future__ import annotations
 
 import argparse
+import select
 import sys
+import termios
 import time
+import tty
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, SupportsInt, cast
@@ -48,6 +51,7 @@ RAD_TO_DEG = 180.0 / 3.141592653589793
 DEG_TO_RAD = 3.141592653589793 / 180.0
 ProfileChoice = Literal["current", "default", "logs", "balance-unicycle", "balance-skateboard"]
 StepChoice = Literal["save", "retry", "skip", "cancel"]
+STEP_PROMPT = "s/Enter=save  r=retry  k=skip  c=cancel"
 
 
 @dataclass(frozen=True)
@@ -164,21 +168,32 @@ def prompt_profile(default: ProfileChoice) -> ProfileChoice:
 def prompt_step(default: StepChoice = "save") -> StepChoice:
     """Prompt for a calibration-step action."""
 
+    while True:
+        answer = input(f"Action: save, retry, skip, cancel [{default}] ").strip().lower()
+        choice = parse_step_choice(answer, default=default)
+        if choice is not None:
+            return choice
+        print("Please choose save, retry, skip, or cancel.")
+
+
+def parse_step_choice(answer: str, *, default: StepChoice) -> StepChoice | None:
+    """Parse a calibration-step action."""
+
     choices: dict[str, StepChoice] = {
+        "": default,
+        "\n": default,
+        "\r": default,
         "s": "save",
         "r": "retry",
         "k": "skip",
         "c": "cancel",
     }
-    while True:
-        answer = input(f"Action: save, retry, skip, cancel [{default}] ").strip().lower()
-        if not answer:
-            return default
-        if answer in choices:
-            return choices[answer]
-        if answer in choices.values():
-            return cast(StepChoice, answer)
-        print("Please choose save, retry, skip, or cancel.")
+    normalized = answer.strip().lower()
+    if normalized in choices:
+        return choices[normalized]
+    if normalized in {"save", "retry", "skip", "cancel"}:
+        return cast(StepChoice, normalized)
+    return None
 
 
 def wait_for_enter(message: str, *, assume_yes: bool) -> None:
@@ -239,6 +254,76 @@ def sample_filtered_imu(
     if status is not None:
         print()
     return state
+
+
+def sample_filtered_imu_until_step_choice(
+    client: VescClient,
+    *,
+    poll_hz: float,
+    status: Callable[[FilteredImuState], str],
+    yaw_estimator: YawOffsetEstimator | None = None,
+) -> tuple[FilteredImuState, StepChoice]:
+    """Poll IMU data until the user chooses a calibration-step action."""
+    # pylint: disable=too-many-locals
+
+    if not sys.stdin.isatty():
+        state = sample_filtered_imu(
+            client,
+            seconds=DEFAULT_SAMPLE_SECONDS,
+            poll_hz=poll_hz,
+            status=status,
+            yaw_estimator=yaw_estimator,
+        )
+        return state, prompt_step()
+
+    state = FilteredImuState()
+    period = 1.0 / poll_hz
+    next_poll = time.monotonic()
+    next_status = 0.0
+    last_line_len = 0
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def render_status() -> None:
+        nonlocal last_line_len
+        line = f"{status(state)} | {STEP_PROMPT}"
+        padding = " " * max(0, last_line_len - len(line))
+        print(f"\r{line}{padding}", end="", flush=True)
+        last_line_len = len(line)
+
+    print(f"Sampling until action ({STEP_PROMPT})")
+    try:
+        tty.setcbreak(fd)
+        while True:
+            values = client.get_imu_data(IMU_SETUP_MASK)
+            state.update(values)
+            if yaw_estimator is not None:
+                yaw_estimator.update(values)
+
+            now = time.monotonic()
+            if now >= next_status:
+                render_status()
+                next_status = now + 0.25
+
+            ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+            if ready:
+                char = sys.stdin.read(1)
+                choice = parse_step_choice(char, default="save")
+                if choice is not None:
+                    print()
+                    return state, choice
+                print(f"\nUnknown action {char!r}. Use {STEP_PROMPT}.")
+                last_line_len = 0
+                render_status()
+
+            next_poll += period
+            sleep_s = max(0.0, next_poll - time.monotonic())
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            else:
+                next_poll = time.monotonic()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def print_basic_config(config: dict[str, object]) -> None:
@@ -375,20 +460,29 @@ def run_gyro_step(
             "Leave the IMU stable in any orientation without vibration.",
             assume_yes=assume_yes,
         )
-        state = sample_filtered_imu(
-            client,
-            seconds=sample_seconds,
-            poll_hz=poll_hz,
-            status=lambda s: (
-                f"Gyro offsets X {s.gyro_x:+.3f}  "
-                f"Y {s.gyro_y:+.3f}  Z {s.gyro_z:+.3f}"
-            ),
-        )
+        def gyro_status(state: FilteredImuState) -> str:
+            return (
+                f"Gyro offsets X {state.gyro_x:+.3f}  "
+                f"Y {state.gyro_y:+.3f}  Z {state.gyro_z:+.3f}"
+            )
+        if assume_yes:
+            state = sample_filtered_imu(
+                client,
+                seconds=sample_seconds,
+                poll_hz=poll_hz,
+                status=gyro_status,
+            )
+            choice: StepChoice = "save"
+        else:
+            state, choice = sample_filtered_imu_until_step_choice(
+                client,
+                poll_hz=poll_hz,
+                status=gyro_status,
+            )
         print(
             f"Measured gyro offsets: X {state.gyro_x:+.6f}, "
             f"Y {state.gyro_y:+.6f}, Z {state.gyro_z:+.6f}"
         )
-        choice = "save" if assume_yes else prompt_step()
         if choice == "save":
             save_gyro_offsets(config, state)
             write_appconf(client, config, store=True, wait_ack=wait_ack)
@@ -451,15 +545,22 @@ def run_accel_step(
                     f"Max {axis_max(state, current_axis):+.3f}"
                 )
 
-            state = sample_filtered_imu(
-                client,
-                seconds=sample_seconds,
-                poll_hz=poll_hz,
-                status=status,
-            )
+            if assume_yes:
+                state = sample_filtered_imu(
+                    client,
+                    seconds=sample_seconds,
+                    poll_hz=poll_hz,
+                    status=status,
+                )
+                choice: StepChoice = "save"
+            else:
+                state, choice = sample_filtered_imu_until_step_choice(
+                    client,
+                    poll_hz=poll_hz,
+                    status=status,
+                )
             max_value = axis_max(state, axis)
             print(f"Measured max {axis.upper()}: {max_value:+.6f}")
-            choice = "save" if assume_yes else prompt_step()
             if choice == "save":
                 save_accel_offset(config, axis, max_value)
                 write_appconf(client, config, store=True, wait_ack=wait_ack)
@@ -520,16 +621,23 @@ def run_roll_orientation(
             "Place the IMU level on a flat stable surface for roll calibration.",
             assume_yes=assume_yes,
         )
-        state = sample_filtered_imu(
-            client,
-            seconds=sample_seconds,
-            poll_hz=poll_hz,
-            status=lambda s: (
-                f"Roll offset {(-s.roll * RAD_TO_DEG - restore.rot_roll):+.3f} deg"
-            ),
-        )
+        def roll_status(state: FilteredImuState) -> str:
+            return f"Roll offset {(-state.roll * RAD_TO_DEG - restore.rot_roll):+.3f} deg"
+        if assume_yes:
+            state = sample_filtered_imu(
+                client,
+                seconds=sample_seconds,
+                poll_hz=poll_hz,
+                status=roll_status,
+            )
+            choice: StepChoice = "save"
+        else:
+            state, choice = sample_filtered_imu_until_step_choice(
+                client,
+                poll_hz=poll_hz,
+                status=roll_status,
+            )
         print(f"Measured roll offset: {(-state.roll * RAD_TO_DEG - restore.rot_roll):+.6f} deg")
-        choice = "save" if assume_yes else prompt_step()
         if choice == "save":
             apply_roll_offset(config, -state.roll)
             write_appconf(client, config, store=False, wait_ack=wait_ack)
@@ -559,18 +667,27 @@ def run_pitch_orientation(
             "Keep the IMU level on a flat stable surface for pitch calibration.",
             assume_yes=assume_yes,
         )
-        state = sample_filtered_imu(
-            client,
-            seconds=sample_seconds,
-            poll_hz=poll_hz,
-            status=lambda s: (
-                f"Pitch offset {(s.pitch * RAD_TO_DEG - restore.rot_pitch):+.3f} deg"
-            ),
-        )
+        def pitch_status(state: FilteredImuState) -> str:
+            return (
+                f"Pitch offset {(state.pitch * RAD_TO_DEG - restore.rot_pitch):+.3f} deg"
+            )
+        if assume_yes:
+            state = sample_filtered_imu(
+                client,
+                seconds=sample_seconds,
+                poll_hz=poll_hz,
+                status=pitch_status,
+            )
+            choice: StepChoice = "save"
+        else:
+            state, choice = sample_filtered_imu_until_step_choice(
+                client,
+                poll_hz=poll_hz,
+                status=pitch_status,
+            )
         print(
             f"Measured pitch offset: {(state.pitch * RAD_TO_DEG - restore.rot_pitch):+.6f} deg"
         )
-        choice = "save" if assume_yes else prompt_step()
         if choice == "save":
             apply_pitch_offset(config, state.pitch)
             write_appconf(client, config, store=False, wait_ack=wait_ack)
@@ -606,16 +723,24 @@ def run_yaw_orientation(
             yaw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
             return f"Yaw offset {yaw_offset:+.3f} deg"
 
-        sample_filtered_imu(
-            client,
-            seconds=sample_seconds,
-            poll_hz=poll_hz,
-            status=status,
-            yaw_estimator=estimator,
-        )
+        if assume_yes:
+            sample_filtered_imu(
+                client,
+                seconds=sample_seconds,
+                poll_hz=poll_hz,
+                status=status,
+                yaw_estimator=estimator,
+            )
+            choice: StepChoice = "save"
+        else:
+            _, choice = sample_filtered_imu_until_step_choice(
+                client,
+                poll_hz=poll_hz,
+                status=status,
+                yaw_estimator=estimator,
+            )
         yaw_offset = -estimator.yaw_offset * RAD_TO_DEG - restore.rot_yaw
         print(f"Measured yaw offset: {yaw_offset:+.6f} deg")
-        choice = "save" if assume_yes else prompt_step()
         if choice == "save":
             apply_yaw_offset(config, -estimator.yaw_offset)
             write_appconf(client, config, store=True, wait_ack=wait_ack)
@@ -797,7 +922,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_SAMPLE_SECONDS,
         metavar="SEC",
-        help="Sample duration for gyro/accel/orientation steps (default: 5.0).",
+        help=(
+            "Sample duration for gyro/accel/orientation steps in --yes mode "
+            "(default: 5.0). Interactive mode samples until you respond."
+        ),
     )
     parser.add_argument(
         "--search-seconds",

@@ -111,7 +111,9 @@ python examples/imu_setup.py --scan-udp
 The setup wizard mirrors the VESC Tool IMU setup flow: basic IMU parameters,
 gyro offsets, accelerometer offsets, and orientation calibration. Use
 `--skip-basic`, `--skip-gyro`, `--skip-accel`, or `--skip-orientation` to run
-only part of the flow.
+only part of the flow. In interactive mode the gyro, accelerometer, and
+orientation steps keep sampling until you press `s`/Enter to save, `r` to retry,
+`k` to skip, or `c` to cancel.
 
 ## Project structure
 
