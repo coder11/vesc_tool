@@ -7,8 +7,12 @@ import pytest
 from examples.poll_imu_fast import (
     AxisPlotHistory,
     AxisSampleBuffer,
+    IMU_PLOT_CHANNELS,
+    ImuPlotHistory,
+    ImuSampleBuffer,
     axis_frequency_spectrum,
     field_value_index,
+    imu_frequency_spectrum,
     parse_accel_axis_arg,
 )
 
@@ -55,6 +59,23 @@ def test_axis_sample_buffer_appends_batch_with_one_overwrite_window() -> None:
     assert dropped == 1
 
 
+def test_imu_sample_buffer_drains_channel_matrix_in_order() -> None:
+    buffer = ImuSampleBuffer(3)
+    values = [
+        tuple(float(index + channel) for channel in range(IMU_PLOT_CHANNELS))
+        for index in range(5)
+    ]
+
+    buffer.append_many(tuple(float(index) for index in range(5)), values)
+    timestamps, drained_values, dropped = buffer.drain()
+
+    assert timestamps.tolist() == [2.0, 3.0, 4.0]
+    assert drained_values.shape == (IMU_PLOT_CHANNELS, 3)
+    assert drained_values[0].tolist() == [2.0, 3.0, 4.0]
+    assert drained_values[8].tolist() == [10.0, 11.0, 12.0]
+    assert dropped == 2
+
+
 def test_axis_plot_history_keeps_latest_fixed_width_samples() -> None:
     history = AxisPlotHistory(3)
 
@@ -74,6 +95,31 @@ def test_axis_plot_history_keeps_latest_fixed_width_samples() -> None:
     assert history.sample_hz() == pytest.approx(1.0)
 
 
+def test_imu_plot_history_keeps_latest_channel_matrix() -> None:
+    history = ImuPlotHistory(3)
+    first_values = np.vstack(
+        [
+            np.array([float(channel), float(channel + 10)], dtype=np.float64)
+            for channel in range(IMU_PLOT_CHANNELS)
+        ]
+    )
+    second_values = np.vstack(
+        [
+            np.array([float(channel + 20), float(channel + 30)], dtype=np.float64)
+            for channel in range(IMU_PLOT_CHANNELS)
+        ]
+    )
+
+    history.append_samples(np.array([0.0, 1.0], dtype=np.float64), first_values)
+    history.append_samples(np.array([2.0, 3.0], dtype=np.float64), second_values)
+
+    assert history.count == 3
+    assert history.latest_timestamp == 3.0
+    assert history.valid_timestamps().tolist() == [1.0, 2.0, 3.0]
+    assert history.valid_values()[0].tolist() == [10.0, 20.0, 30.0]
+    assert history.valid_values()[8].tolist() == [18.0, 28.0, 38.0]
+
+
 def test_axis_frequency_spectrum_uses_recent_time_window() -> None:
     timestamps = np.arange(0.0, 4.0, 0.01, dtype=np.float64)
     values = np.sin(2.0 * math.pi * 5.0 * timestamps)
@@ -86,4 +132,20 @@ def test_axis_frequency_spectrum_uses_recent_time_window() -> None:
 
     assert sample_count == 200
     assert frequencies[peak_index] == pytest.approx(5.0, abs=0.1)
+    assert nyquist_hz == pytest.approx(50.0)
+
+
+def test_imu_frequency_spectrum_finds_channel_peak() -> None:
+    timestamps = np.arange(0.0, 4.0, 0.01, dtype=np.float64)
+    values = np.zeros((IMU_PLOT_CHANNELS, timestamps.size), dtype=np.float64)
+    values[3] = np.sin(2.0 * math.pi * 7.0 * timestamps)
+
+    spectrum = imu_frequency_spectrum(timestamps, values, window_s=2.0)
+
+    assert spectrum is not None
+    frequencies, magnitudes, nyquist_hz, sample_count = spectrum
+    peak_index = int(np.argmax(magnitudes[3, 1:]) + 1)
+
+    assert sample_count == 200
+    assert frequencies[peak_index] == pytest.approx(7.0, abs=0.1)
     assert nyquist_hz == pytest.approx(50.0)

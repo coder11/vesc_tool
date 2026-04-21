@@ -105,7 +105,7 @@ The PyQtGraph live plot uses the VESC Tool `--tcpServer` bridge by default at
 python examples/poll_imu_fast.py --port /dev/ttyACM0
 python examples/poll_imu_fast.py --duration 10 --pipeline-depth 4
 python examples/poll_imu_fast.py --ui-rate 10
-python examples/poll_imu_fast.py --plot --plot-axis z --pipeline-depth 4
+python examples/poll_imu_fast.py --plot --pipeline-depth 4
 python examples/poll_imu_fast.py --no-tui --status-interval 1
 python examples/poll_imu_fast.py --fields rpy,acc,gyro --csv > imu.csv
 ```
@@ -119,14 +119,15 @@ received sample. Use `--pipeline-depth` to keep multiple requests in flight over
 USB, and use `--mask` or `--fields` to reduce the response size when only some
 IMU channels are needed.
 
-For a high-rate graphical view, `--plot` opens a PyQtGraph window for one
-accelerometer axis plus a frequency-analysis plot. When `--mask`/`--fields` is
-not provided, plot mode requests only the selected axis to reduce serial payload
-size, batches samples through a ring buffer, and redraws the time curve at
-`--plot-rate` instead of waking the UI for every packet. The display path also
-caps rendered points with `--plot-max-points` so long histories do not force
-PyQtGraph to draw every collected sample. The FFT uses raw samples from the last
-`--fft-window` seconds (default 2) and refreshes independently at `--fft-rate`.
+For a high-rate graphical view, `--plot` opens a PyQtGraph 2x3 grid matching
+`imu_live_plot.py`: accelerometer, gyroscope, and RPY time-series plots in the
+left column, with frequency-analysis plots in the right column. When
+`--mask`/`--fields` is not provided, plot mode requests RPY + accelerometer +
+gyroscope (`0x01ff`). Samples are batched through a ring buffer, the time plots
+redraw at `--plot-rate`, and rendered points are capped with `--plot-max-points`
+so long histories do not force PyQtGraph to draw every collected sample. The FFT
+uses raw samples from the last `--fft-window` seconds (default 2) and refreshes
+independently at `--fft-rate`.
 
 ### IMU setup wizard
 

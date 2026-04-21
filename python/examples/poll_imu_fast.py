@@ -56,6 +56,27 @@ PLOT_SAMPLE_BATCH_NS = 5_000_000
 DEFAULT_PIPELINE_DEPTH = 1
 NSEC_PER_SEC = 1_000_000_000
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+ROLL_INDEX = 0
+PITCH_INDEX = 1
+YAW_INDEX = 2
+ACC_X_INDEX = 3
+ACC_Y_INDEX = 4
+ACC_Z_INDEX = 5
+GYRO_X_INDEX = 6
+GYRO_Y_INDEX = 7
+GYRO_Z_INDEX = 8
+IMU_PLOT_CHANNELS = 9
+IMU_PLOT_FIELDS: tuple[str, ...] = (
+    "roll",
+    "pitch",
+    "yaw",
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z",
+)
 
 FIELD_NAMES: tuple[str, ...] = (
     "roll",
@@ -172,7 +193,12 @@ class PlotTheme:
     title_color: str
     status_color: str
     grid_alpha: float
-    line_color: tuple[int, int, int]
+    line_colors: tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
+
+    @property
+    def line_color(self) -> tuple[int, int, int]:
+        """Primary line color for the legacy single-axis plot helper."""
+        return self.line_colors[0]
 
 
 PLOT_THEMES: dict[str, PlotTheme] = {
@@ -183,7 +209,7 @@ PLOT_THEMES: dict[str, PlotTheme] = {
         title_color="#202124",
         status_color="#4f5b66",
         grid_alpha=0.22,
-        line_color=(196, 57, 54),
+        line_colors=((196, 57, 54), (28, 128, 75), (37, 98, 180)),
     ),
     "dark": PlotTheme(
         pg_background="#000000",
@@ -192,7 +218,7 @@ PLOT_THEMES: dict[str, PlotTheme] = {
         title_color="#999999",
         status_color="#999999",
         grid_alpha=0.3,
-        line_color=(80, 190, 120),
+        line_colors=((230, 88, 85), (80, 190, 120), (85, 150, 245)),
     ),
 }
 
@@ -738,6 +764,118 @@ class AxisSampleBuffer:
             return timestamps, values, dropped
 
 
+class ImuSampleBuffer:
+    """Thread-safe overwrite ring for full 9-channel plot samples."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be greater than 0")
+        np_module = import_numpy()
+        self._capacity = capacity
+        self._timestamps: npt.NDArray[np.float64] = np_module.zeros(
+            capacity,
+            dtype=np_module.float64,
+        )
+        self._values: npt.NDArray[np.float64] = np_module.zeros(
+            (IMU_PLOT_CHANNELS, capacity),
+            dtype=np_module.float64,
+        )
+        self._lock = threading.Lock()
+        self._read_index = 0
+        self._write_index = 0
+        self._count = 0
+        self._dropped = 0
+
+    def append_many(
+        self,
+        timestamps: Sequence[float],
+        values: Sequence[Sequence[float]],
+    ) -> None:
+        """Append batched IMU samples while taking the shared lock once."""
+        count = len(timestamps)
+        if count == 0:
+            return
+        if count != len(values):
+            raise ValueError("timestamp and value counts must match")
+
+        np_module = import_numpy()
+        value_array = np_module.asarray(values, dtype=np_module.float64)
+        if value_array.shape != (count, IMU_PLOT_CHANNELS):
+            raise ValueError(
+                f"values must have shape ({count}, {IMU_PLOT_CHANNELS}), "
+                f"got {value_array.shape}"
+            )
+
+        with self._lock:
+            if count >= self._capacity:
+                self._dropped += self._count + count - self._capacity
+                self._timestamps[:] = timestamps[-self._capacity :]
+                self._values[:, :] = value_array[-self._capacity :].T
+                self._read_index = 0
+                self._write_index = 0
+                self._count = self._capacity
+                return
+
+            overflow = max(0, self._count + count - self._capacity)
+            if overflow > 0:
+                self._read_index = (self._read_index + overflow) % self._capacity
+                self._dropped += overflow
+            self._count = min(self._capacity, self._count + count)
+
+            first_count = min(count, self._capacity - self._write_index)
+            self._timestamps[self._write_index : self._write_index + first_count] = (
+                timestamps[:first_count]
+            )
+            self._values[:, self._write_index : self._write_index + first_count] = (
+                value_array[:first_count].T
+            )
+
+            remaining = count - first_count
+            if remaining > 0:
+                self._timestamps[:remaining] = timestamps[first_count:]
+                self._values[:, :remaining] = value_array[first_count:].T
+
+            self._write_index = (self._write_index + count) % self._capacity
+
+    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], int]:
+        """Return pending samples in order and clear the pending ring."""
+        np_module = import_numpy()
+        with self._lock:
+            count = self._count
+            dropped = self._dropped
+            self._dropped = 0
+            if count == 0:
+                return (
+                    np_module.empty(0, dtype=np_module.float64),
+                    np_module.empty((IMU_PLOT_CHANNELS, 0), dtype=np_module.float64),
+                    dropped,
+                )
+
+            read_index = self._read_index
+            if read_index + count <= self._capacity:
+                timestamps = self._timestamps[read_index : read_index + count].copy()
+                values = self._values[:, read_index : read_index + count].copy()
+            else:
+                first_count = self._capacity - read_index
+                timestamps = np_module.concatenate(
+                    (
+                        self._timestamps[read_index:],
+                        self._timestamps[: count - first_count],
+                    )
+                )
+                values = np_module.concatenate(
+                    (
+                        self._values[:, read_index:],
+                        self._values[:, : count - first_count],
+                    ),
+                    axis=1,
+                )
+
+            self._read_index = self._write_index
+            self._count = 0
+            return timestamps, values, dropped
+
+
 class AxisPlotHistory:
     """Fixed-size numeric history for one plotted axis."""
 
@@ -834,6 +972,127 @@ class AxisPlotHistory:
         )
 
 
+class ImuPlotHistory:
+    """Fixed-size ring history for the 9-channel IMU plot grid."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be greater than 0")
+        np_module = import_numpy()
+        self._capacity = capacity
+        self._count = 0
+        self._write_index = 0
+        self._timestamps: npt.NDArray[np.float64] = np_module.zeros(
+            capacity,
+            dtype=np_module.float64,
+        )
+        self._values: npt.NDArray[np.float64] = np_module.zeros(
+            (IMU_PLOT_CHANNELS, capacity),
+            dtype=np_module.float64,
+        )
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def latest_timestamp(self) -> float | None:
+        if self._count == 0:
+            return None
+        return float(self._timestamps[(self._write_index - 1) % self._capacity])
+
+    def valid_timestamps(self) -> npt.NDArray[np.float64]:
+        if self._count == 0:
+            return self._timestamps[:0]
+        return self._ordered_timestamps()
+
+    def valid_values(self) -> npt.NDArray[np.float64]:
+        if self._count == 0:
+            return self._values[:, :0]
+        return self._ordered_values()
+
+    def sample_hz(self) -> float | None:
+        if self._count < 2:
+            return None
+
+        timestamps = self.valid_timestamps()
+        elapsed = timestamps[-1] - timestamps[0]
+        if elapsed <= 0.0:
+            return None
+        return float((self._count - 1) / elapsed)
+
+    def append_samples(
+        self,
+        timestamps: npt.NDArray[np.float64],
+        values: npt.NDArray[np.float64],
+    ) -> None:
+        sample_count = int(timestamps.size)
+        if sample_count == 0:
+            return
+        if values.shape != (IMU_PLOT_CHANNELS, sample_count):
+            raise ValueError(
+                f"values must have shape ({IMU_PLOT_CHANNELS}, {sample_count}), "
+                f"got {values.shape}"
+            )
+
+        if sample_count >= self._capacity:
+            self._timestamps[:] = timestamps[-self._capacity :]
+            self._values[:, :] = values[:, -self._capacity :]
+            self._count = self._capacity
+            self._write_index = 0
+            return
+
+        first_count = min(sample_count, self._capacity - self._write_index)
+        self._timestamps[self._write_index : self._write_index + first_count] = (
+            timestamps[:first_count]
+        )
+        self._values[:, self._write_index : self._write_index + first_count] = values[
+            :,
+            :first_count,
+        ]
+
+        remaining = sample_count - first_count
+        if remaining > 0:
+            self._timestamps[:remaining] = timestamps[first_count:]
+            self._values[:, :remaining] = values[:, first_count:]
+
+        self._write_index = (self._write_index + sample_count) % self._capacity
+        self._count = min(self._capacity, self._count + sample_count)
+
+    def _ordered_timestamps(self) -> npt.NDArray[np.float64]:
+        np_module = import_numpy()
+        start = (self._write_index - self._count) % self._capacity
+        if start + self._count <= self._capacity:
+            return self._timestamps[start : start + self._count]
+        return cast(
+            "npt.NDArray[np.float64]",
+            np_module.concatenate(
+                (self._timestamps[start:], self._timestamps[: self._write_index])
+            ),
+        )
+
+    def _ordered_values(self) -> npt.NDArray[np.float64]:
+        np_module = import_numpy()
+        start = (self._write_index - self._count) % self._capacity
+        if start + self._count <= self._capacity:
+            return self._values[:, start : start + self._count]
+        return cast(
+            "npt.NDArray[np.float64]",
+            np_module.concatenate(
+                (self._values[:, start:], self._values[:, : self._write_index]),
+                axis=1,
+            ),
+        )
+
+
+@dataclass
+class FrequencyAxisRange:
+    """Track frequency plot bounds so ranges are not forced every FFT."""
+
+    x_max: float = 0.0
+    y_max: float = 0.0
+
+
 def axis_frequency_spectrum(
     timestamps: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
@@ -870,6 +1129,47 @@ def axis_frequency_spectrum(
     magnitudes = np_module.abs(np_module.fft.rfft(centered)) / sample_count
     if magnitudes.size > 2:
         magnitudes[1:-1] *= 2.0
+
+    nyquist_hz = 0.5 / sample_period
+    return frequencies, magnitudes, nyquist_hz, sample_count
+
+
+def imu_frequency_spectrum(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+    *,
+    window_s: float,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
+    """Return FFT bins and channel magnitudes for the recent IMU window."""
+    if timestamps.size < 2:
+        return None
+
+    np_module = import_numpy()
+    window_start_s = float(timestamps[-1]) - window_s
+    start_index = int(np_module.searchsorted(timestamps, window_start_s, side="left"))
+    window_timestamps = timestamps[start_index:]
+    window_values = values[:, start_index:]
+    sample_count = int(window_timestamps.size)
+    if sample_count < 2:
+        return None
+
+    sample_periods = np_module.diff(window_timestamps)
+    sample_periods = sample_periods[sample_periods > 0.0]
+    if sample_periods.size == 0:
+        return None
+
+    sample_period = float(np_module.median(sample_periods))
+    if not math.isfinite(sample_period) or sample_period <= 0.0:
+        return None
+
+    centered = window_values - np_module.mean(window_values, axis=1, keepdims=True)
+    if sample_count > 2:
+        centered = centered * np_module.hanning(sample_count)
+
+    frequencies = np_module.fft.rfftfreq(sample_count, d=sample_period)
+    magnitudes = np_module.abs(np_module.fft.rfft(centered, axis=1)) / sample_count
+    if magnitudes.shape[1] > 2:
+        magnitudes[:, 1:-1] *= 2.0
 
     nyquist_hz = 0.5 / sample_period
     return frequencies, magnitudes, nyquist_hz, sample_count
@@ -1036,6 +1336,191 @@ class FastImuAxisPoller:
             self._done.set()
 
 
+class FastImuPlotPoller:
+    """Poll and decode the 9 channels used by the IMU plot grid."""
+
+    def __init__(
+        self,
+        serial_port: SerialLike,
+        *,
+        request: bytes,
+        mask: int,
+        packet_timeout: float,
+        duration: float,
+        max_samples: int,
+        pipeline_depth: int,
+        pending_samples: int,
+    ) -> None:
+        missing_fields = [
+            field_name
+            for field_name in IMU_PLOT_FIELDS
+            if field_value_index(mask, field_name) is None
+        ]
+        if missing_fields:
+            fields = ", ".join(missing_fields)
+            raise ValueError(f"mask 0x{mask:04x} does not include plot fields: {fields}")
+
+        self._serial_port = serial_port
+        self._request = request
+        self._mask = mask
+        self._field_indexes = tuple(
+            cast(int, field_value_index(mask, field_name))
+            for field_name in IMU_PLOT_FIELDS
+        )
+        self._packet_timeout = packet_timeout
+        self._duration = duration
+        self._max_samples = max_samples
+        self._pipeline_depth = pipeline_depth
+        self._samples = ImuSampleBuffer(pending_samples)
+        self._reader_stats = ReaderStats()
+        self._poll_stats = PollStats()
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="vesc-fast-imu-grid-poller",
+            daemon=True,
+        )
+        self._start_ns = 0
+        self._latest_sample_s: float | None = None
+        self._latest_values: tuple[float, ...] | None = None
+        self._last_error: str | None = None
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], int]:
+        return self._samples.drain()
+
+    def snapshot(self) -> FastPlotSnapshot:
+        now_ns = time.perf_counter_ns()
+        elapsed_s = (
+            (now_ns - self._start_ns) / NSEC_PER_SEC
+            if self._start_ns > 0
+            else 0.0
+        )
+        average_rate = (
+            self._poll_stats.samples / elapsed_s
+            if elapsed_s > 0.0
+            else 0.0
+        )
+        latest_value = None if self._latest_values is None else self._latest_values[ACC_Z_INDEX]
+        return FastPlotSnapshot(
+            samples=self._poll_stats.samples,
+            requests=self._poll_stats.requests,
+            timeouts=self._poll_stats.timeouts,
+            parse_errors=self._poll_stats.parse_errors,
+            bad_crc=self._reader_stats.bad_crc,
+            bad_stop=self._reader_stats.bad_stop,
+            discarded_bytes=self._reader_stats.discarded_bytes,
+            unexpected_packets=self._reader_stats.unexpected_packets,
+            elapsed_s=elapsed_s,
+            average_rate_hz=average_rate,
+            latest_sample_s=self._latest_sample_s,
+            latest_value=latest_value,
+            last_error=self._last_error,
+            done=self.done,
+        )
+
+    def _values_from_payload(self, payload: bytes) -> tuple[float, ...]:
+        parsed = parse_imu_payload(payload)
+        if parsed.mask != self._mask:
+            field_indexes_list = []
+            for field_name in IMU_PLOT_FIELDS:
+                value_index = field_value_index(parsed.mask, field_name)
+                if value_index is None:
+                    raise ValueError(
+                        f"IMU response mask 0x{parsed.mask:04x} does not include "
+                        f"{field_name}"
+                    )
+                field_indexes_list.append(value_index)
+            field_indexes = tuple(field_indexes_list)
+        else:
+            field_indexes = self._field_indexes
+
+        rad2deg = 180.0 / math.pi
+        raw_values = parsed.values
+        return (
+            raw_values[field_indexes[ROLL_INDEX]] * rad2deg,
+            raw_values[field_indexes[PITCH_INDEX]] * rad2deg,
+            raw_values[field_indexes[YAW_INDEX]] * rad2deg,
+            raw_values[field_indexes[ACC_X_INDEX]],
+            raw_values[field_indexes[ACC_Y_INDEX]],
+            raw_values[field_indexes[ACC_Z_INDEX]],
+            raw_values[field_indexes[GYRO_X_INDEX]],
+            raw_values[field_indexes[GYRO_Y_INDEX]],
+            raw_values[field_indexes[GYRO_Z_INDEX]],
+        )
+
+    def _run(self) -> None:
+        self._start_ns = time.perf_counter_ns()
+        outstanding = 0
+        pending_timestamps: list[float] = []
+        pending_values: list[tuple[float, ...]] = []
+        next_batch_ns = self._start_ns + PLOT_SAMPLE_BATCH_NS
+
+        def flush_pending() -> None:
+            if not pending_timestamps:
+                return
+            self._samples.append_many(pending_timestamps, pending_values)
+            pending_timestamps.clear()
+            pending_values.clear()
+
+        try:
+            while not self._stop.is_set() and not should_stop(
+                self._start_ns,
+                self._poll_stats.samples,
+                duration=self._duration,
+                max_samples=self._max_samples,
+            ):
+                while outstanding < self._pipeline_depth and not self._stop.is_set():
+                    self._serial_port.write(self._request)
+                    self._poll_stats.requests += 1
+                    outstanding += 1
+
+                payload = read_expected_imu_packet(
+                    self._serial_port,
+                    self._packet_timeout,
+                    self._reader_stats,
+                )
+                now_ns = time.perf_counter_ns()
+                if payload is None:
+                    self._poll_stats.timeouts += 1
+                    outstanding = 0
+                    self._serial_port.reset_input_buffer()
+                    continue
+
+                outstanding = max(0, outstanding - 1)
+                self._poll_stats.samples += 1
+                try:
+                    values = self._values_from_payload(payload)
+                except ValueError as exc:
+                    self._poll_stats.parse_errors += 1
+                    self._last_error = str(exc)
+                    continue
+
+                sample_s = (now_ns - self._start_ns) / NSEC_PER_SEC
+                self._latest_sample_s = sample_s
+                self._latest_values = values
+                self._last_error = None
+                pending_timestamps.append(sample_s)
+                pending_values.append(values)
+                if len(pending_timestamps) >= PLOT_SAMPLE_BATCH or now_ns >= next_batch_ns:
+                    flush_pending()
+                    next_batch_ns = now_ns + PLOT_SAMPLE_BATCH_NS
+        finally:
+            flush_pending()
+            self._done.set()
+
+
 def import_pyqtgraph() -> tuple[Any, Any, Any]:
     """Import PyQtGraph lazily so non-plot commands do not require Qt."""
     if (
@@ -1080,6 +1565,332 @@ def require_qt_platform_runtime() -> None:
             "(`nix develop .#python`), or install the matching system packages "
             "(for example libxcb-cursor0 and libxcb-icccm4 on Debian/Ubuntu)."
         )
+
+
+def run_fast_imu_grid_plot(
+    poller: FastImuPlotPoller,
+    *,
+    history: int,
+    max_points: int,
+    plot_rate: float,
+    fft_window: float,
+    fft_rate: float,
+    theme: str,
+    antialias: bool,
+) -> None:
+    """Run the fast direct-USB 2x3 IMU plot grid."""
+    selected_theme = PLOT_THEMES[theme]
+    np_module = import_numpy()
+    pg, QtCore, QtWidgets = import_pyqtgraph()
+    pg.setConfigOptions(
+        antialias=antialias,
+        background=selected_theme.pg_background,
+        foreground=selected_theme.pg_foreground,
+    )
+
+    require_qt_platform_runtime()
+    app = pg.mkQApp("VESC Fast IMU Data")
+    window = QtWidgets.QWidget()
+    window.setWindowTitle("VESC Fast IMU Data")
+    window.resize(1400, 900)
+    window.setStyleSheet(f"background-color: {selected_theme.window_background};")
+
+    qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
+    title = QtWidgets.QLabel("VESC Fast IMU Data")
+    title.setAlignment(qt_alignment.AlignCenter)
+    title.setStyleSheet(
+        f"font-size: 14pt; font-weight: 700; color: {selected_theme.title_color};"
+    )
+    status = QtWidgets.QLabel("Waiting for IMU data...")
+    status.setStyleSheet(f"color: {selected_theme.status_color};")
+
+    layout = QtWidgets.QGridLayout(window)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    layout.addWidget(title, 0, 0, 1, 2)
+    layout.addWidget(status, 4, 0, 1, 2)
+    for row in (1, 2, 3):
+        layout.setRowStretch(row, 1)
+    for col in (0, 1):
+        layout.setColumnStretch(col, 1)
+
+    qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
+
+    def make_plot(
+        row: int,
+        col: int,
+        title_text: str,
+        y_label: str,
+        *,
+        x_label: str | None = None,
+        y_range: tuple[float, float] | None = None,
+    ) -> Any:
+        plot_widget = pg.PlotWidget(title=title_text)
+        plot_widget.setMinimumSize(0, 0)
+        plot_widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
+        layout.addWidget(plot_widget, row, col)
+        plot = plot_widget.getPlotItem()
+        plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
+        plot.addLegend(offset=(10, 10))
+        plot.setLabel("left", y_label)
+        plot.getAxis("left").setWidth(56)
+        plot.getAxis("bottom").setHeight(36)
+        if x_label is not None:
+            plot.setLabel("bottom", x_label)
+        if y_range is not None:
+            plot.setYRange(*y_range, padding=0.0)
+        for method_name, args in (
+            ("setClipToView", (True,)),
+            ("setDownsampling", (1, True, "peak")),
+        ):
+            method = getattr(plot, method_name, None)
+            if method is not None:
+                method(*args)
+        return plot
+
+    def add_lines(plot: Any, names: tuple[str, str, str], width: float) -> tuple[Any, Any, Any]:
+        empty = np_module.empty(0, dtype=np_module.float64)
+        lines = []
+        for name, color in zip(names, selected_theme.line_colors):
+            line = pg.PlotCurveItem(
+                empty,
+                empty,
+                pen=pg.mkPen(color, width=width),
+                name=name,
+                connect="all",
+                skipFiniteCheck=True,
+            )
+            line.setSkipFiniteCheck(True)
+            plot.addItem(line)
+            lines.append(line)
+        return cast(tuple[Any, Any, Any], tuple(lines))
+
+    ax_acc = make_plot(1, 0, "Accel Data", "g", y_range=(-8, 8))
+    ax_gyro = make_plot(2, 0, "Gyro Data", "Gyro", y_range=(-2000, 2000))
+    ax_rpy = make_plot(3, 0, "RPY Data", "Degrees", x_label="Time (s)", y_range=(-200, 200))
+    acc_lines = add_lines(ax_acc, ("Acc X", "Acc Y", "Acc Z"), 1.5)
+    gyro_lines = add_lines(ax_gyro, ("Gyro X", "Gyro Y", "Gyro Z"), 1.5)
+    rpy_lines = add_lines(ax_rpy, ("Roll", "Pitch", "Yaw"), 1.5)
+
+    ax_acc_freq = make_plot(1, 1, "Accel Data Frequency Analysis", "Magnitude")
+    ax_gyro_freq = make_plot(2, 1, "Gyro Data Frequency Analysis", "Magnitude")
+    ax_rpy_freq = make_plot(
+        3,
+        1,
+        "RPY Data Frequency Analysis",
+        "Magnitude",
+        x_label="Frequency (Hz)",
+    )
+    acc_freq_lines = add_lines(ax_acc_freq, ("Acc X", "Acc Y", "Acc Z"), 1.2)
+    gyro_freq_lines = add_lines(ax_gyro_freq, ("Gyro X", "Gyro Y", "Gyro Z"), 1.2)
+    rpy_freq_lines = add_lines(ax_rpy_freq, ("Roll", "Pitch", "Yaw"), 1.2)
+    acc_freq_range = FrequencyAxisRange()
+    gyro_freq_range = FrequencyAxisRange()
+    rpy_freq_range = FrequencyAxisRange()
+
+    plot_history = ImuPlotHistory(history)
+    refresh_timestamps: deque[float] = deque(maxlen=120)
+    dropped_pending = 0
+    latest_nyquist_hz: float | None = None
+    latest_fft_samples = 0
+
+    def decimation_indexes(sample_count: int) -> npt.NDArray[np.intp] | None:
+        if sample_count <= max_points:
+            return None
+        return cast(
+            "npt.NDArray[np.intp]",
+            np_module.linspace(0, sample_count - 1, max_points, dtype=np_module.intp),
+        )
+
+    def set_time_lines(
+        lines: tuple[Any, Any, Any],
+        channel_indexes: tuple[int, int, int],
+        x_values: npt.NDArray[np.float64],
+        values: npt.NDArray[np.float64],
+    ) -> None:
+        for line, channel_index in zip(lines, channel_indexes):
+            line.setData(
+                x=x_values,
+                y=values[channel_index],
+                connect="all",
+                skipFiniteCheck=True,
+            )
+
+    def update_x_range(axis: Any, x_values: npt.NDArray[np.float64]) -> None:
+        if x_values.size >= 2:
+            axis.setXRange(float(x_values[0]), float(x_values[-1]), padding=0.0)
+
+    def actual_plot_hz() -> float | None:
+        if len(refresh_timestamps) < 2:
+            return None
+        elapsed = refresh_timestamps[-1] - refresh_timestamps[0]
+        if elapsed <= 0.0:
+            return None
+        return (len(refresh_timestamps) - 1) / elapsed
+
+    def refresh_plot() -> None:
+        nonlocal dropped_pending
+
+        timestamps, values, dropped = poller.drain()
+        dropped_pending += dropped
+        if timestamps.size == 0:
+            return
+
+        refresh_timestamps.append(time.monotonic())
+        plot_history.append_samples(timestamps, values)
+        x_values = plot_history.valid_timestamps()
+        plot_values = plot_history.valid_values()
+        indexes = decimation_indexes(int(x_values.size))
+        if indexes is not None:
+            x_values = x_values[indexes]
+            plot_values = plot_values[:, indexes]
+
+        set_time_lines(acc_lines, (ACC_X_INDEX, ACC_Y_INDEX, ACC_Z_INDEX), x_values, plot_values)
+        set_time_lines(
+            gyro_lines,
+            (GYRO_X_INDEX, GYRO_Y_INDEX, GYRO_Z_INDEX),
+            x_values,
+            plot_values,
+        )
+        set_time_lines(rpy_lines, (ROLL_INDEX, PITCH_INDEX, YAW_INDEX), x_values, plot_values)
+        update_x_range(ax_acc, x_values)
+        update_x_range(ax_gyro, x_values)
+        update_x_range(ax_rpy, x_values)
+
+    def update_frequency_axis(
+        axis: Any,
+        lines: tuple[Any, Any, Any],
+        magnitudes: npt.NDArray[np.float64],
+        channel_indexes: tuple[int, int, int],
+        frequencies: npt.NDArray[np.float64],
+        axis_range: FrequencyAxisRange,
+    ) -> None:
+        max_magnitude = 0.0
+        for line, channel_index in zip(lines, channel_indexes):
+            channel_magnitudes = magnitudes[channel_index]
+            if channel_magnitudes.size > 0:
+                max_magnitude = max(max_magnitude, float(np_module.max(channel_magnitudes)))
+            line.setData(
+                x=frequencies,
+                y=channel_magnitudes,
+                connect="all",
+                skipFiniteCheck=True,
+            )
+
+        next_x_max = max(float(frequencies[-1]), 1.0)
+        if not math.isclose(next_x_max, axis_range.x_max, rel_tol=0.01, abs_tol=0.01):
+            axis.setXRange(0.0, next_x_max, padding=0.0)
+            axis_range.x_max = next_x_max
+
+        next_y_max = max(max_magnitude * 1.1, 1e-9)
+        if (
+            axis_range.y_max == 0.0
+            or next_y_max > axis_range.y_max
+            or next_y_max < axis_range.y_max * 0.5
+        ):
+            axis.setYRange(0.0, next_y_max, padding=0.0)
+            axis_range.y_max = next_y_max
+
+    def refresh_spectrum() -> None:
+        nonlocal latest_nyquist_hz, latest_fft_samples
+
+        spectrum = imu_frequency_spectrum(
+            plot_history.valid_timestamps(),
+            plot_history.valid_values(),
+            window_s=fft_window,
+        )
+        if spectrum is None:
+            latest_nyquist_hz = None
+            latest_fft_samples = 0
+            return
+
+        frequencies, magnitudes, nyquist_hz, sample_count = spectrum
+        latest_nyquist_hz = nyquist_hz
+        latest_fft_samples = sample_count
+        update_frequency_axis(
+            ax_acc_freq,
+            acc_freq_lines,
+            magnitudes,
+            (ACC_X_INDEX, ACC_Y_INDEX, ACC_Z_INDEX),
+            frequencies,
+            acc_freq_range,
+        )
+        update_frequency_axis(
+            ax_gyro_freq,
+            gyro_freq_lines,
+            magnitudes,
+            (GYRO_X_INDEX, GYRO_Y_INDEX, GYRO_Z_INDEX),
+            frequencies,
+            gyro_freq_range,
+        )
+        update_frequency_axis(
+            ax_rpy_freq,
+            rpy_freq_lines,
+            magnitudes,
+            (ROLL_INDEX, PITCH_INDEX, YAW_INDEX),
+            frequencies,
+            rpy_freq_range,
+        )
+
+    def refresh_status() -> None:
+        snapshot = poller.snapshot()
+        sample_hz = plot_history.sample_hz()
+        sample_text = "measuring" if sample_hz is None else f"{sample_hz:.1f} Hz"
+        plot_hz = actual_plot_hz()
+        plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
+        fft_text = (
+            "FFT: measuring"
+            if latest_nyquist_hz is None
+            else f"FFT: {latest_fft_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
+        )
+        error_text = (
+            f" | error: {snapshot.last_error}"
+            if snapshot.last_error is not None
+            else ""
+        )
+        state = "stopped" if snapshot.done else "running"
+        status.setText(
+            f"{state} | samples: {snapshot.samples} | "
+            f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
+            f"plot: {plot_text} | {fft_text} | timeouts: {snapshot.timeouts} | "
+            f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
+            f"dropped_ui: {dropped_pending}{error_text}"
+        )
+
+    plot_timer = QtCore.QTimer()
+    plot_timer.setInterval(round(1000.0 / plot_rate))
+    plot_timer.timeout.connect(refresh_plot)
+
+    fft_timer = QtCore.QTimer()
+    fft_timer.setInterval(round(1000.0 / fft_rate))
+    fft_timer.timeout.connect(refresh_spectrum)
+
+    status_timer = QtCore.QTimer()
+    status_timer.setInterval(round(1000.0 / DEFAULT_STATUS_INTERVAL))
+    status_timer.timeout.connect(refresh_status)
+
+    def stop_updates(*_args: object) -> None:
+        plot_timer.stop()
+        fft_timer.stop()
+        status_timer.stop()
+
+    window.destroyed.connect(stop_updates)
+    refresh_plot()
+    refresh_spectrum()
+    refresh_status()
+    window.show()
+    poller.start()
+    plot_timer.start()
+    fft_timer.start()
+    status_timer.start()
+
+    exec_app = getattr(app, "exec", None)
+    if exec_app is None:
+        exec_app = app.exec_
+    try:
+        exec_app()
+    finally:
+        poller.stop()
 
 
 def run_accel_axis_plot(
@@ -1561,8 +2372,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot",
         action="store_true",
         help=(
-            "Open a PyQtGraph UI that plots one accelerometer axis against time. "
-            "If --mask/--fields is omitted, only the selected axis is requested."
+            "Open a PyQtGraph 2x3 UI with accel, gyro, and RPY time/frequency plots. "
+            "If --mask/--fields is omitted, RPY + accelerometer + gyroscope are requested."
         ),
     )
     parser.add_argument(
@@ -1570,7 +2381,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_accel_axis_arg,
         default="acc_x",
         metavar="AXIS",
-        help="Accelerometer axis for --plot: x, y, z, acc_x, acc_y, or acc_z (default: x).",
+        help="Legacy single-axis plot selector; ignored by the 2x3 plot grid.",
     )
     parser.add_argument(
         "--plot-history",
@@ -1702,14 +2513,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.plot and args.print_every > 0:
         parser.error("--plot cannot be combined with --print-every")
 
-    user_selected_mask = args.fields is not None or args.mask is not None
-    mask = FIELD_MASKS[args.plot_axis] if args.plot and not user_selected_mask else DEFAULT_MASK
+    mask = DEFAULT_MASK
     if args.fields is not None:
         mask = args.fields
     if args.mask is not None:
         mask = args.mask
-    if args.plot and field_value_index(mask, args.plot_axis) is None:
-        parser.error(f"--plot-axis {args.plot_axis} is not included in mask 0x{mask:04x}")
+    if args.plot:
+        missing_plot_fields = [
+            field_name
+            for field_name in IMU_PLOT_FIELDS
+            if field_value_index(mask, field_name) is None
+        ]
+        if missing_plot_fields:
+            fields = ", ".join(missing_plot_fields)
+            parser.error(f"--plot requires mask 0x{DEFAULT_MASK:04x} fields; missing: {fields}")
 
     print_every = args.print_every
     if args.csv and print_every == 0:
@@ -1746,20 +2563,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     try:
         if args.plot:
-            plot_poller = FastImuAxisPoller(
+            plot_poller = FastImuPlotPoller(
                 serial_port,
                 request=request,
                 mask=mask,
-                field_name=args.plot_axis,
                 packet_timeout=args.timeout,
                 duration=args.duration,
                 max_samples=args.max_samples,
                 pipeline_depth=args.pipeline_depth,
                 pending_samples=args.plot_pending,
             )
-            run_accel_axis_plot(
+            run_fast_imu_grid_plot(
                 plot_poller,
-                axis_name=args.plot_axis,
                 history=args.plot_history,
                 max_points=args.plot_max_points,
                 plot_rate=args.plot_rate,
