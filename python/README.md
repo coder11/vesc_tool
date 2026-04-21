@@ -99,6 +99,25 @@ The PyQtGraph live plot uses the VESC Tool `--tcpServer` bridge by default at
 `127.0.0.1:65102`. The `--mask` flag controls which IMU fields are requested
 (default `0x01ff` = roll/pitch/yaw + accelerometer + gyroscope).
 
+### Fast USB IMU poller
+
+```bash
+python examples/poll_imu_fast.py --port /dev/ttyACM0
+python examples/poll_imu_fast.py --duration 10 --pipeline-depth 4
+python examples/poll_imu_fast.py --ui-rate 10
+python examples/poll_imu_fast.py --no-tui --status-interval 1
+python examples/poll_imu_fast.py --fields rpy,acc,gyro --csv > imu.csv
+```
+
+`poll_imu_fast.py` talks directly to the VESC USB serial port and keeps the
+hot path small for maximum poll rate: it pre-encodes the IMU request, validates
+packets with CRC, decodes values without Pydantic models, and avoids per-sample
+printing by default. In an interactive terminal it shows an in-place line-by-line
+IMU view at a capped UI rate while measuring the real poll rate from every
+received sample. Use `--pipeline-depth` to keep multiple requests in flight over
+USB, and use `--mask` or `--fields` to reduce the response size when only some
+IMU channels are needed.
+
 ### IMU setup wizard
 
 ```bash
@@ -144,6 +163,7 @@ python/
   tests/                   # unit tests (pytest, no hardware required)
   examples/
     imu_live_plot.py       # PyQtGraph live IMU plot
+    poll_imu_fast.py       # Direct USB serial high-rate IMU poller
     imu_setup.py           # Interactive IMU setup wizard
     imu_setup_gui.py       # PySide6 IMU setup wizard
 ```
