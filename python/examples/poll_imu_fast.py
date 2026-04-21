@@ -47,7 +47,10 @@ DEFAULT_STATUS_INTERVAL = 1.0
 DEFAULT_UI_RATE = 10.0
 DEFAULT_PLOT_RATE = 30.0
 DEFAULT_PLOT_HISTORY = 5000
+DEFAULT_PLOT_MAX_POINTS = 1200
 DEFAULT_PLOT_PENDING = 20000
+PLOT_SAMPLE_BATCH = 64
+PLOT_SAMPLE_BATCH_NS = 5_000_000
 DEFAULT_PIPELINE_DEPTH = 1
 NSEC_PER_SEC = 1_000_000_000
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
@@ -650,16 +653,50 @@ class AxisSampleBuffer:
 
     def append(self, timestamp_s: float, value: float) -> None:
         """Append one sample, overwriting the oldest pending sample if full."""
-        with self._lock:
-            if self._count == self._capacity:
-                self._read_index = (self._read_index + 1) % self._capacity
-                self._dropped += 1
-            else:
-                self._count += 1
+        self.append_many((timestamp_s,), (value,))
 
-            self._timestamps[self._write_index] = timestamp_s
-            self._values[self._write_index] = value
-            self._write_index = (self._write_index + 1) % self._capacity
+    def append_many(
+        self,
+        timestamps: Sequence[float],
+        values: Sequence[float],
+    ) -> None:
+        """Append multiple samples while taking the shared lock once."""
+        count = len(timestamps)
+        if count == 0:
+            return
+        if count != len(values):
+            raise ValueError("timestamp and value counts must match")
+
+        with self._lock:
+            if count >= self._capacity:
+                self._dropped += self._count + count - self._capacity
+                self._timestamps[:] = timestamps[-self._capacity :]
+                self._values[:] = values[-self._capacity :]
+                self._read_index = 0
+                self._write_index = 0
+                self._count = self._capacity
+                return
+
+            overflow = max(0, self._count + count - self._capacity)
+            if overflow > 0:
+                self._read_index = (self._read_index + overflow) % self._capacity
+                self._dropped += overflow
+            self._count = min(self._capacity, self._count + count)
+
+            first_count = min(count, self._capacity - self._write_index)
+            self._timestamps[self._write_index : self._write_index + first_count] = (
+                timestamps[:first_count]
+            )
+            self._values[self._write_index : self._write_index + first_count] = values[
+                :first_count
+            ]
+
+            remaining = count - first_count
+            if remaining > 0:
+                self._timestamps[:remaining] = timestamps[first_count:]
+                self._values[:remaining] = values[first_count:]
+
+            self._write_index = (self._write_index + count) % self._capacity
 
     def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], int]:
         """Return pending samples in order and clear the pending ring."""
@@ -873,6 +910,17 @@ class FastImuAxisPoller:
     def _run(self) -> None:
         self._start_ns = time.perf_counter_ns()
         outstanding = 0
+        pending_timestamps: list[float] = []
+        pending_values: list[float] = []
+        next_batch_ns = self._start_ns + PLOT_SAMPLE_BATCH_NS
+
+        def flush_pending() -> None:
+            if not pending_timestamps:
+                return
+            self._samples.append_many(pending_timestamps, pending_values)
+            pending_timestamps.clear()
+            pending_values.clear()
+
         try:
             while not self._stop.is_set() and not should_stop(
                 self._start_ns,
@@ -910,8 +958,13 @@ class FastImuAxisPoller:
                 self._latest_sample_s = sample_s
                 self._latest_value = value
                 self._last_error = None
-                self._samples.append(sample_s, value)
+                pending_timestamps.append(sample_s)
+                pending_values.append(value)
+                if len(pending_timestamps) >= PLOT_SAMPLE_BATCH or now_ns >= next_batch_ns:
+                    flush_pending()
+                    next_batch_ns = now_ns + PLOT_SAMPLE_BATCH_NS
         finally:
+            flush_pending()
             self._done.set()
 
 
@@ -966,6 +1019,7 @@ def run_accel_axis_plot(
     *,
     axis_name: str,
     history: int,
+    max_points: int,
     plot_rate: float,
     theme: str,
     antialias: bool,
@@ -1053,9 +1107,21 @@ def run_accel_axis_plot(
         plot_history.append_samples(timestamps, values)
         x_values = plot_history.valid_timestamps()
         y_values = plot_history.valid_values()
+        if x_values.size > max_points:
+            index_values = np_module.linspace(
+                0,
+                x_values.size - 1,
+                max_points,
+                dtype=np_module.intp,
+            )
+            plot_x_values = x_values[index_values]
+            plot_y_values = y_values[index_values]
+        else:
+            plot_x_values = x_values
+            plot_y_values = y_values
         line.setData(
-            x=x_values,
-            y=y_values,
+            x=plot_x_values,
+            y=plot_y_values,
             connect="all",
             skipFiniteCheck=True,
         )
@@ -1377,6 +1443,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Number of samples retained by the plot (default: {DEFAULT_PLOT_HISTORY}).",
     )
     parser.add_argument(
+        "--plot-max-points",
+        type=int,
+        default=DEFAULT_PLOT_MAX_POINTS,
+        metavar="N",
+        help=(
+            "Maximum points sent to PyQtGraph each redraw after display decimation "
+            f"(default: {DEFAULT_PLOT_MAX_POINTS})."
+        ),
+    )
+    parser.add_argument(
         "--plot-rate",
         type=float,
         default=DEFAULT_PLOT_RATE,
@@ -1454,6 +1530,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--ui-rate must be greater than 0")
     if args.plot_history <= 0:
         parser.error("--plot-history must be greater than 0")
+    if args.plot_max_points <= 0:
+        parser.error("--plot-max-points must be greater than 0")
     if args.plot_rate <= 0.0:
         parser.error("--plot-rate must be greater than 0")
     if args.plot_pending <= 0:
@@ -1528,6 +1606,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 plot_poller,
                 axis_name=args.plot_axis,
                 history=args.plot_history,
+                max_points=args.plot_max_points,
                 plot_rate=args.plot_rate,
                 theme=args.theme,
                 antialias=args.antialias,

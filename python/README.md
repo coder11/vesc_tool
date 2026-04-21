@@ -123,7 +123,8 @@ For a high-rate graphical view, `--plot` opens a PyQtGraph window for one
 accelerometer axis. When `--mask`/`--fields` is not provided, plot mode requests
 only the selected axis to reduce serial payload size, batches samples through a
 ring buffer, and redraws the curve at `--plot-rate` instead of waking the UI for
-every packet.
+every packet. The display path also caps rendered points with `--plot-max-points`
+so long histories do not force PyQtGraph to draw every collected sample.
 
 ### IMU setup wizard
 

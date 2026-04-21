@@ -41,6 +41,18 @@ def test_axis_sample_buffer_drains_in_order_after_overwrite() -> None:
     assert dropped == 2
 
 
+def test_axis_sample_buffer_appends_batch_with_one_overwrite_window() -> None:
+    buffer = AxisSampleBuffer(4)
+
+    buffer.append(0.0, 10.0)
+    buffer.append_many((1.0, 2.0, 3.0, 4.0), (11.0, 12.0, 13.0, 14.0))
+    timestamps, values, dropped = buffer.drain()
+
+    assert timestamps.tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert values.tolist() == [11.0, 12.0, 13.0, 14.0]
+    assert dropped == 1
+
+
 def test_axis_plot_history_keeps_latest_fixed_width_samples() -> None:
     history = AxisPlotHistory(3)
 
