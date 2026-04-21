@@ -105,6 +105,7 @@ The PyQtGraph live plot uses the VESC Tool `--tcpServer` bridge by default at
 python examples/poll_imu_fast.py --port /dev/ttyACM0
 python examples/poll_imu_fast.py --duration 10 --pipeline-depth 4
 python examples/poll_imu_fast.py --ui-rate 10
+python examples/poll_imu_fast.py --plot --plot-axis z --pipeline-depth 4
 python examples/poll_imu_fast.py --no-tui --status-interval 1
 python examples/poll_imu_fast.py --fields rpy,acc,gyro --csv > imu.csv
 ```
@@ -117,6 +118,12 @@ IMU view at a capped UI rate while measuring the real poll rate from every
 received sample. Use `--pipeline-depth` to keep multiple requests in flight over
 USB, and use `--mask` or `--fields` to reduce the response size when only some
 IMU channels are needed.
+
+For a high-rate graphical view, `--plot` opens a PyQtGraph window for one
+accelerometer axis. When `--mask`/`--fields` is not provided, plot mode requests
+only the selected axis to reduce serial payload size, batches samples through a
+ring buffer, and redraws the curve at `--plot-rate` instead of waking the UI for
+every packet.
 
 ### IMU setup wizard
 

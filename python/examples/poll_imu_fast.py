@@ -10,19 +10,24 @@ Examples:
     python examples/poll_imu_fast.py
     python examples/poll_imu_fast.py --port /dev/ttyACM0 --duration 10
     python examples/poll_imu_fast.py --fields rpy,acc,gyro --pipeline-depth 4
+    python examples/poll_imu_fast.py --plot --plot-axis z --pipeline-depth 4
     python examples/poll_imu_fast.py --mask 0x01ff --csv > imu.csv
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import math
+import os
 import struct
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, TextIO, cast
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 import serial  # type: ignore[import-untyped]
 
@@ -31,13 +36,21 @@ from vesc_py.comm_ids import CommPacketId
 from vesc_py.crc import crc16
 from vesc_py.packet import MAX_PACKET_LEN, encode_packet
 
+if TYPE_CHECKING:
+    import numpy as np
+    import numpy.typing as npt
+
 DEFAULT_BAUDRATE = 115200
 DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
 DEFAULT_TIMEOUT = 0.1
 DEFAULT_STATUS_INTERVAL = 1.0
 DEFAULT_UI_RATE = 10.0
+DEFAULT_PLOT_RATE = 30.0
+DEFAULT_PLOT_HISTORY = 5000
+DEFAULT_PLOT_PENDING = 20000
 DEFAULT_PIPELINE_DEPTH = 1
 NSEC_PER_SEC = 1_000_000_000
+QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
 
 FIELD_NAMES: tuple[str, ...] = (
     "roll",
@@ -75,6 +88,29 @@ FIELD_GROUP_MASKS: dict[str, int] = {
     "quaternion": 0xF000,
     "all": 0xFFFF,
 }
+ACCEL_AXIS_ALIASES: dict[str, str] = {
+    "x": "acc_x",
+    "acc_x": "acc_x",
+    "accel_x": "acc_x",
+    "y": "acc_y",
+    "acc_y": "acc_y",
+    "accel_y": "acc_y",
+    "z": "acc_z",
+    "acc_z": "acc_z",
+    "accel_z": "acc_z",
+}
+
+
+def import_numpy() -> Any:
+    """Import NumPy lazily so non-plot commands keep their original dependency path."""
+    try:
+        import numpy as numpy_module
+    except ImportError as exc:
+        raise RuntimeError(
+            "Plot mode requires numpy. Install the project dependencies, or install "
+            "it directly with `python -m pip install numpy`."
+        ) from exc
+    return numpy_module
 
 
 class SerialLike(Protocol):
@@ -119,6 +155,61 @@ class ParsedImu:
     mask: int
     values: tuple[float, ...]
     vesc_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlotTheme:
+    """Colors for the single-axis PyQtGraph view."""
+
+    pg_background: str
+    pg_foreground: str
+    window_background: str
+    title_color: str
+    status_color: str
+    grid_alpha: float
+    line_color: tuple[int, int, int]
+
+
+PLOT_THEMES: dict[str, PlotTheme] = {
+    "light": PlotTheme(
+        pg_background="#ffffff",
+        pg_foreground="#202124",
+        window_background="#f6f7f9",
+        title_color="#202124",
+        status_color="#4f5b66",
+        grid_alpha=0.22,
+        line_color=(196, 57, 54),
+    ),
+    "dark": PlotTheme(
+        pg_background="#000000",
+        pg_foreground="#d0d0d0",
+        window_background="#000000",
+        title_color="#999999",
+        status_color="#999999",
+        grid_alpha=0.3,
+        line_color=(80, 190, 120),
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FastPlotSnapshot:
+    """Low-rate status data read by the plot UI."""
+
+    samples: int
+    requests: int
+    timeouts: int
+    parse_errors: int
+    bad_crc: int
+    bad_stop: int
+    discarded_bytes: int
+    unexpected_packets: int
+    elapsed_s: float
+    average_rate_hz: float
+    latest_sample_s: float | None
+    latest_value: float | None
+    last_error: str | None
+    done: bool
 
 
 class TerminalImuDisplay:
@@ -240,9 +331,34 @@ def parse_fields_arg(text: str) -> int:
     return mask
 
 
+def parse_accel_axis_arg(text: str) -> str:
+    """Parse a single accelerometer axis name."""
+    token = text.strip().lower().replace("-", "_")
+    try:
+        return ACCEL_AXIS_ALIASES[token]
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError(
+            "axis must be one of x, y, z, acc_x, acc_y, or acc_z"
+        ) from exc
+
+
 def field_names_for_mask(mask: int) -> tuple[str, ...]:
     """Return IMU field names in VESC wire order for *mask*."""
     return tuple(name for index, name in enumerate(FIELD_NAMES) if mask & (1 << index))
+
+
+def field_value_index(mask: int, field_name: str) -> int | None:
+    """Return the decoded values tuple index for *field_name* under *mask*."""
+    try:
+        field_index = FIELD_NAMES.index(field_name)
+    except ValueError:
+        return None
+
+    field_bit = 1 << field_index
+    if not mask & field_bit:
+        return None
+    preceding_fields = mask & (field_bit - 1)
+    return preceding_fields.bit_count()
 
 
 def decode_double32_auto(word: int) -> float:
@@ -510,6 +626,496 @@ def should_stop(
     return False
 
 
+class AxisSampleBuffer:
+    """Thread-safe overwrite ring for samples waiting for the UI tick."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be greater than 0")
+        np_module = import_numpy()
+        self._capacity = capacity
+        self._timestamps: npt.NDArray[np.float64] = np_module.zeros(
+            capacity,
+            dtype=np_module.float64,
+        )
+        self._values: npt.NDArray[np.float64] = np_module.zeros(
+            capacity,
+            dtype=np_module.float64,
+        )
+        self._lock = threading.Lock()
+        self._read_index = 0
+        self._write_index = 0
+        self._count = 0
+        self._dropped = 0
+
+    def append(self, timestamp_s: float, value: float) -> None:
+        """Append one sample, overwriting the oldest pending sample if full."""
+        with self._lock:
+            if self._count == self._capacity:
+                self._read_index = (self._read_index + 1) % self._capacity
+                self._dropped += 1
+            else:
+                self._count += 1
+
+            self._timestamps[self._write_index] = timestamp_s
+            self._values[self._write_index] = value
+            self._write_index = (self._write_index + 1) % self._capacity
+
+    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], int]:
+        """Return pending samples in order and clear the pending ring."""
+        np_module = import_numpy()
+        with self._lock:
+            count = self._count
+            dropped = self._dropped
+            self._dropped = 0
+            if count == 0:
+                return (
+                    np_module.empty(0, dtype=np_module.float64),
+                    np_module.empty(0, dtype=np_module.float64),
+                    dropped,
+                )
+
+            read_index = self._read_index
+            if read_index + count <= self._capacity:
+                timestamps = self._timestamps[read_index : read_index + count].copy()
+                values = self._values[read_index : read_index + count].copy()
+            else:
+                first_count = self._capacity - read_index
+                timestamps = np_module.concatenate(
+                    (
+                        self._timestamps[read_index:],
+                        self._timestamps[: count - first_count],
+                    )
+                )
+                values = np_module.concatenate(
+                    (
+                        self._values[read_index:],
+                        self._values[: count - first_count],
+                    )
+                )
+
+            self._read_index = self._write_index
+            self._count = 0
+            return timestamps, values, dropped
+
+
+class AxisPlotHistory:
+    """Fixed-size numeric history for one plotted axis."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be greater than 0")
+        np_module = import_numpy()
+        self._capacity = capacity
+        self._count = 0
+        self._timestamps: npt.NDArray[np.float64] = np_module.zeros(
+            capacity,
+            dtype=np_module.float64,
+        )
+        self._values: npt.NDArray[np.float64] = np_module.zeros(
+            capacity,
+            dtype=np_module.float64,
+        )
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def latest_timestamp(self) -> float | None:
+        if self._count == 0:
+            return None
+        return float(self._timestamps[-1])
+
+    def valid_timestamps(self) -> npt.NDArray[np.float64]:
+        if self._count == 0:
+            return self._timestamps[:0]
+        return self._timestamps[-self._count :]
+
+    def valid_values(self) -> npt.NDArray[np.float64]:
+        if self._count == 0:
+            return self._values[:0]
+        return self._values[-self._count :]
+
+    def sample_hz(self) -> float | None:
+        if self._count < 2:
+            return None
+
+        timestamps = self.valid_timestamps()
+        elapsed = timestamps[-1] - timestamps[0]
+        if elapsed <= 0.0:
+            return None
+
+        return float((self._count - 1) / elapsed)
+
+    def append_samples(
+        self,
+        timestamps: npt.NDArray[np.float64],
+        values: npt.NDArray[np.float64],
+    ) -> None:
+        sample_count = int(timestamps.size)
+        if sample_count == 0:
+            return
+
+        if sample_count >= self._capacity:
+            self._timestamps[:] = timestamps[-self._capacity :]
+            self._values[:] = values[-self._capacity :]
+            self._count = self._capacity
+            return
+
+        self._timestamps[:-sample_count] = self._timestamps[sample_count:]
+        self._timestamps[-sample_count:] = timestamps
+        self._values[:-sample_count] = self._values[sample_count:]
+        self._values[-sample_count:] = values
+        self._count = min(self._capacity, self._count + sample_count)
+
+
+class FastImuAxisPoller:
+    """Poll a single decoded IMU field on a background thread."""
+
+    def __init__(
+        self,
+        serial_port: SerialLike,
+        *,
+        request: bytes,
+        mask: int,
+        field_name: str,
+        packet_timeout: float,
+        duration: float,
+        max_samples: int,
+        pipeline_depth: int,
+        pending_samples: int,
+    ) -> None:
+        value_index = field_value_index(mask, field_name)
+        if value_index is None:
+            raise ValueError(f"mask 0x{mask:04x} does not include {field_name}")
+
+        self._serial_port = serial_port
+        self._request = request
+        self._mask = mask
+        self._field_name = field_name
+        self._field_value_index = value_index
+        self._packet_timeout = packet_timeout
+        self._duration = duration
+        self._max_samples = max_samples
+        self._pipeline_depth = pipeline_depth
+        self._samples = AxisSampleBuffer(pending_samples)
+        self._reader_stats = ReaderStats()
+        self._poll_stats = PollStats()
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="vesc-fast-imu-axis-poller",
+            daemon=True,
+        )
+        self._start_ns = 0
+        self._latest_sample_s: float | None = None
+        self._latest_value: float | None = None
+        self._last_error: str | None = None
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], int]:
+        return self._samples.drain()
+
+    def snapshot(self) -> FastPlotSnapshot:
+        now_ns = time.perf_counter_ns()
+        elapsed_s = (
+            (now_ns - self._start_ns) / NSEC_PER_SEC
+            if self._start_ns > 0
+            else 0.0
+        )
+        average_rate = (
+            self._poll_stats.samples / elapsed_s
+            if elapsed_s > 0.0
+            else 0.0
+        )
+        return FastPlotSnapshot(
+            samples=self._poll_stats.samples,
+            requests=self._poll_stats.requests,
+            timeouts=self._poll_stats.timeouts,
+            parse_errors=self._poll_stats.parse_errors,
+            bad_crc=self._reader_stats.bad_crc,
+            bad_stop=self._reader_stats.bad_stop,
+            discarded_bytes=self._reader_stats.discarded_bytes,
+            unexpected_packets=self._reader_stats.unexpected_packets,
+            elapsed_s=elapsed_s,
+            average_rate_hz=average_rate,
+            latest_sample_s=self._latest_sample_s,
+            latest_value=self._latest_value,
+            last_error=self._last_error,
+            done=self.done,
+        )
+
+    def _value_from_payload(self, payload: bytes) -> float:
+        parsed = parse_imu_payload(payload)
+        if parsed.mask == self._mask:
+            return parsed.values[self._field_value_index]
+
+        value_index = field_value_index(parsed.mask, self._field_name)
+        if value_index is None:
+            raise ValueError(
+                f"IMU response mask 0x{parsed.mask:04x} does not include "
+                f"{self._field_name}"
+            )
+        return parsed.values[value_index]
+
+    def _run(self) -> None:
+        self._start_ns = time.perf_counter_ns()
+        outstanding = 0
+        try:
+            while not self._stop.is_set() and not should_stop(
+                self._start_ns,
+                self._poll_stats.samples,
+                duration=self._duration,
+                max_samples=self._max_samples,
+            ):
+                while outstanding < self._pipeline_depth and not self._stop.is_set():
+                    self._serial_port.write(self._request)
+                    self._poll_stats.requests += 1
+                    outstanding += 1
+
+                payload = read_expected_imu_packet(
+                    self._serial_port,
+                    self._packet_timeout,
+                    self._reader_stats,
+                )
+                now_ns = time.perf_counter_ns()
+                if payload is None:
+                    self._poll_stats.timeouts += 1
+                    outstanding = 0
+                    self._serial_port.reset_input_buffer()
+                    continue
+
+                outstanding = max(0, outstanding - 1)
+                self._poll_stats.samples += 1
+                try:
+                    value = self._value_from_payload(payload)
+                except ValueError as exc:
+                    self._poll_stats.parse_errors += 1
+                    self._last_error = str(exc)
+                    continue
+
+                sample_s = (now_ns - self._start_ns) / NSEC_PER_SEC
+                self._latest_sample_s = sample_s
+                self._latest_value = value
+                self._last_error = None
+                self._samples.append(sample_s, value)
+        finally:
+            self._done.set()
+
+
+def import_pyqtgraph() -> tuple[Any, Any, Any]:
+    """Import PyQtGraph lazily so non-plot commands do not require Qt."""
+    if (
+        sys.platform.startswith("linux")
+        and "QT_QPA_PLATFORM" not in os.environ
+        and "DISPLAY" in os.environ
+    ):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+    try:
+        import pyqtgraph as pg  # type: ignore[import-untyped]
+        from pyqtgraph.Qt import QtCore  # type: ignore[import-untyped]
+        from pyqtgraph.Qt import QtWidgets
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyQtGraph plotting requires pyqtgraph and a Qt binding. "
+            "Install the project dependencies, or install them directly with "
+            "`python -m pip install pyqtgraph PySide6`."
+        ) from exc
+
+    return pg, QtCore, QtWidgets
+
+
+def require_qt_platform_runtime() -> None:
+    """Fail before QApplication aborts when XCB runtime libraries are missing."""
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("QT_QPA_PLATFORM") != "xcb":
+        return
+
+    missing: list[str] = []
+    for lib_name in QT_XCB_RUNTIME_LIBS:
+        try:
+            ctypes.CDLL(lib_name)
+        except OSError:
+            missing.append(lib_name)
+
+    if missing:
+        raise RuntimeError(
+            "Qt's xcb platform plugin is missing runtime libraries: "
+            f"{', '.join(missing)}. Run this from the python Nix dev shell "
+            "(`nix develop .#python`), or install the matching system packages "
+            "(for example libxcb-cursor0 and libxcb-icccm4 on Debian/Ubuntu)."
+        )
+
+
+def run_accel_axis_plot(
+    poller: FastImuAxisPoller,
+    *,
+    axis_name: str,
+    history: int,
+    plot_rate: float,
+    theme: str,
+    antialias: bool,
+) -> None:
+    """Run a batched single-axis PyQtGraph plot."""
+    selected_theme = PLOT_THEMES[theme]
+    np_module = import_numpy()
+    pg, QtCore, QtWidgets = import_pyqtgraph()
+    pg.setConfigOptions(
+        antialias=antialias,
+        background=selected_theme.pg_background,
+        foreground=selected_theme.pg_foreground,
+    )
+
+    require_qt_platform_runtime()
+    app = pg.mkQApp("VESC Fast IMU Axis Plot")
+    window = QtWidgets.QWidget()
+    window.setWindowTitle("VESC Fast IMU Axis Plot")
+    window.resize(1000, 620)
+    window.setStyleSheet(f"background-color: {selected_theme.window_background};")
+
+    qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
+    title = QtWidgets.QLabel(f"VESC {axis_name.upper()} Fast Plot")
+    title.setAlignment(qt_alignment.AlignCenter)
+    title.setStyleSheet(
+        f"font-size: 14pt; font-weight: 700; color: {selected_theme.title_color};"
+    )
+    status = QtWidgets.QLabel("Waiting for IMU data...")
+    status.setStyleSheet(f"color: {selected_theme.status_color};")
+
+    layout = QtWidgets.QVBoxLayout(window)
+    layout.setContentsMargins(8, 8, 8, 8)
+    layout.setSpacing(8)
+    layout.addWidget(title)
+    plot_widget = pg.PlotWidget()
+    layout.addWidget(plot_widget, stretch=1)
+    layout.addWidget(status)
+
+    plot = plot_widget.getPlotItem()
+    plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
+    plot.setLabel("left", axis_name, units="g")
+    plot.setLabel("bottom", "time", units="s")
+    plot.setYRange(-8.0, 8.0, padding=0.0)
+    plot.enableAutoRange(axis="y", enable=False)
+    for method_name, args in (
+        ("setClipToView", (True,)),
+        ("setDownsampling", (1, True, "peak")),
+    ):
+        method = getattr(plot, method_name, None)
+        if method is not None:
+            method(*args)
+
+    line = pg.PlotCurveItem(
+        np_module.empty(0, dtype=np_module.float64),
+        np_module.empty(0, dtype=np_module.float64),
+        pen=pg.mkPen(selected_theme.line_color, width=1.5),
+        name=axis_name,
+        connect="all",
+        skipFiniteCheck=True,
+    )
+    line.setSkipFiniteCheck(True)
+    plot.addItem(line)
+
+    plot_history = AxisPlotHistory(history)
+    refresh_timestamps: deque[float] = deque(maxlen=120)
+    dropped_pending = 0
+
+    def actual_plot_hz() -> float | None:
+        if len(refresh_timestamps) < 2:
+            return None
+        elapsed = refresh_timestamps[-1] - refresh_timestamps[0]
+        if elapsed <= 0.0:
+            return None
+        return (len(refresh_timestamps) - 1) / elapsed
+
+    def refresh_plot() -> None:
+        nonlocal dropped_pending
+
+        timestamps, values, dropped = poller.drain()
+        dropped_pending += dropped
+        if timestamps.size == 0:
+            return
+
+        refresh_timestamps.append(time.monotonic())
+        plot_history.append_samples(timestamps, values)
+        x_values = plot_history.valid_timestamps()
+        y_values = plot_history.valid_values()
+        line.setData(
+            x=x_values,
+            y=y_values,
+            connect="all",
+            skipFiniteCheck=True,
+        )
+        if x_values.size >= 2:
+            plot.setXRange(float(x_values[0]), float(x_values[-1]), padding=0.0)
+
+    def refresh_status() -> None:
+        snapshot = poller.snapshot()
+        latest = (
+            "n/a"
+            if snapshot.latest_value is None
+            else f"{snapshot.latest_value:.6g} g"
+        )
+        sample_hz = plot_history.sample_hz()
+        sample_text = "measuring" if sample_hz is None else f"{sample_hz:.1f} Hz"
+        plot_hz = actual_plot_hz()
+        plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
+        error_text = (
+            f" | error: {snapshot.last_error}"
+            if snapshot.last_error is not None
+            else ""
+        )
+        state = "stopped" if snapshot.done else "running"
+        status.setText(
+            f"{state} | latest: {latest} | samples: {snapshot.samples} | "
+            f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
+            f"plot: {plot_text} | timeouts: {snapshot.timeouts} | "
+            f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
+            f"dropped_ui: {dropped_pending}{error_text}"
+        )
+
+    plot_timer = QtCore.QTimer()
+    plot_timer.setInterval(round(1000.0 / plot_rate))
+    plot_timer.timeout.connect(refresh_plot)
+
+    status_timer = QtCore.QTimer()
+    status_timer.setInterval(round(1000.0 / DEFAULT_STATUS_INTERVAL))
+    status_timer.timeout.connect(refresh_status)
+
+    def stop_updates(*_args: object) -> None:
+        plot_timer.stop()
+        status_timer.stop()
+
+    window.destroyed.connect(stop_updates)
+    refresh_plot()
+    refresh_status()
+    window.show()
+    poller.start()
+    plot_timer.start()
+    status_timer.start()
+
+    exec_app = getattr(app, "exec", None)
+    if exec_app is None:
+        exec_app = app.exec_
+    try:
+        exec_app()
+    finally:
+        poller.stop()
+
+
 def poll_imu(
     serial_port: SerialLike,
     *,
@@ -749,6 +1355,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the in-place terminal UI and use plain periodic status lines.",
     )
     parser.add_argument(
+        "--plot",
+        action="store_true",
+        help=(
+            "Open a PyQtGraph UI that plots one accelerometer axis against time. "
+            "If --mask/--fields is omitted, only the selected axis is requested."
+        ),
+    )
+    parser.add_argument(
+        "--plot-axis",
+        type=parse_accel_axis_arg,
+        default="acc_x",
+        metavar="AXIS",
+        help="Accelerometer axis for --plot: x, y, z, acc_x, acc_y, or acc_z (default: x).",
+    )
+    parser.add_argument(
+        "--plot-history",
+        type=int,
+        default=DEFAULT_PLOT_HISTORY,
+        metavar="N",
+        help=f"Number of samples retained by the plot (default: {DEFAULT_PLOT_HISTORY}).",
+    )
+    parser.add_argument(
+        "--plot-rate",
+        type=float,
+        default=DEFAULT_PLOT_RATE,
+        metavar="HZ",
+        help=f"Plot redraw rate in Hz (default: {DEFAULT_PLOT_RATE:g}).",
+    )
+    parser.add_argument(
+        "--plot-pending",
+        type=int,
+        default=DEFAULT_PLOT_PENDING,
+        metavar="N",
+        help=(
+            "Pending sample ring size between the poll thread and UI "
+            f"(default: {DEFAULT_PLOT_PENDING})."
+        ),
+    )
+    parser.add_argument(
+        "--theme",
+        choices=tuple(PLOT_THEMES),
+        default="light",
+        help="Plot theme for --plot (default: light).",
+    )
+    parser.add_argument(
+        "--antialias",
+        action="store_true",
+        help="Enable PyQtGraph antialiasing in --plot mode. Disabled by default for speed.",
+    )
+    parser.add_argument(
         "--print-every",
         type=int,
         default=0,
@@ -796,16 +1452,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--status-interval must be greater than or equal to 0")
     if args.ui_rate <= 0.0:
         parser.error("--ui-rate must be greater than 0")
+    if args.plot_history <= 0:
+        parser.error("--plot-history must be greater than 0")
+    if args.plot_rate <= 0.0:
+        parser.error("--plot-rate must be greater than 0")
+    if args.plot_pending <= 0:
+        parser.error("--plot-pending must be greater than 0")
     if args.print_every < 0:
         parser.error("--print-every must be greater than or equal to 0")
     if args.pipeline_depth <= 0:
         parser.error("--pipeline-depth must be greater than 0")
+    if args.plot and args.csv:
+        parser.error("--plot cannot be combined with --csv")
+    if args.plot and args.no_decode:
+        parser.error("--plot cannot be combined with --no-decode")
+    if args.plot and args.print_every > 0:
+        parser.error("--plot cannot be combined with --print-every")
 
-    mask = DEFAULT_MASK
+    user_selected_mask = args.fields is not None or args.mask is not None
+    mask = FIELD_MASKS[args.plot_axis] if args.plot and not user_selected_mask else DEFAULT_MASK
     if args.fields is not None:
         mask = args.fields
     if args.mask is not None:
         mask = args.mask
+    if args.plot and field_value_index(mask, args.plot_axis) is None:
+        parser.error(f"--plot-axis {args.plot_axis} is not included in mask 0x{mask:04x}")
 
     print_every = args.print_every
     if args.csv and print_every == 0:
@@ -831,7 +1502,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(
         f"Opening {port} at {args.baudrate} baud; mask=0x{mask:04x} ({fields}); "
         f"pipeline_depth={args.pipeline_depth}; "
-        f"display={'tui' if tui is not None else 'plain'}",
+        f"display={'plot' if args.plot else 'tui' if tui is not None else 'plain'}",
         file=sys.stderr,
     )
     serial_port = open_serial(
@@ -841,20 +1512,41 @@ def main(argv: Sequence[str] | None = None) -> None:
         exclusive=not args.no_exclusive,
     )
     try:
-        poll_imu(
-            serial_port,
-            request=request,
-            mask=mask,
-            packet_timeout=args.timeout,
-            status_interval=args.status_interval,
-            duration=args.duration,
-            max_samples=args.max_samples,
-            pipeline_depth=args.pipeline_depth,
-            print_every=print_every,
-            csv=args.csv,
-            no_decode=args.no_decode,
-            tui=tui,
-        )
+        if args.plot:
+            plot_poller = FastImuAxisPoller(
+                serial_port,
+                request=request,
+                mask=mask,
+                field_name=args.plot_axis,
+                packet_timeout=args.timeout,
+                duration=args.duration,
+                max_samples=args.max_samples,
+                pipeline_depth=args.pipeline_depth,
+                pending_samples=args.plot_pending,
+            )
+            run_accel_axis_plot(
+                plot_poller,
+                axis_name=args.plot_axis,
+                history=args.plot_history,
+                plot_rate=args.plot_rate,
+                theme=args.theme,
+                antialias=args.antialias,
+            )
+        else:
+            poll_imu(
+                serial_port,
+                request=request,
+                mask=mask,
+                packet_timeout=args.timeout,
+                status_interval=args.status_interval,
+                duration=args.duration,
+                max_samples=args.max_samples,
+                pipeline_depth=args.pipeline_depth,
+                print_every=print_every,
+                csv=args.csv,
+                no_decode=args.no_decode,
+                tui=tui,
+            )
     finally:
         serial_port.close()
 
