@@ -120,11 +120,13 @@ USB, and use `--mask` or `--fields` to reduce the response size when only some
 IMU channels are needed.
 
 For a high-rate graphical view, `--plot` opens a PyQtGraph window for one
-accelerometer axis. When `--mask`/`--fields` is not provided, plot mode requests
-only the selected axis to reduce serial payload size, batches samples through a
-ring buffer, and redraws the curve at `--plot-rate` instead of waking the UI for
-every packet. The display path also caps rendered points with `--plot-max-points`
-so long histories do not force PyQtGraph to draw every collected sample.
+accelerometer axis plus a frequency-analysis plot. When `--mask`/`--fields` is
+not provided, plot mode requests only the selected axis to reduce serial payload
+size, batches samples through a ring buffer, and redraws the time curve at
+`--plot-rate` instead of waking the UI for every packet. The display path also
+caps rendered points with `--plot-max-points` so long histories do not force
+PyQtGraph to draw every collected sample. The FFT uses raw samples from the last
+`--fft-window` seconds (default 2) and refreshes independently at `--fft-rate`.
 
 ### IMU setup wizard
 

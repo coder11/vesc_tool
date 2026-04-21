@@ -1,4 +1,5 @@
 import argparse
+import math
 
 import numpy as np
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from examples.poll_imu_fast import (
     AxisPlotHistory,
     AxisSampleBuffer,
+    axis_frequency_spectrum,
     field_value_index,
     parse_accel_axis_arg,
 )
@@ -70,3 +72,18 @@ def test_axis_plot_history_keeps_latest_fixed_width_samples() -> None:
     assert history.valid_timestamps().tolist() == [1.0, 2.0, 3.0]
     assert history.valid_values().tolist() == [11.0, 12.0, 13.0]
     assert history.sample_hz() == pytest.approx(1.0)
+
+
+def test_axis_frequency_spectrum_uses_recent_time_window() -> None:
+    timestamps = np.arange(0.0, 4.0, 0.01, dtype=np.float64)
+    values = np.sin(2.0 * math.pi * 5.0 * timestamps)
+
+    spectrum = axis_frequency_spectrum(timestamps, values, window_s=2.0)
+
+    assert spectrum is not None
+    frequencies, magnitudes, nyquist_hz, sample_count = spectrum
+    peak_index = int(np.argmax(magnitudes[1:]) + 1)
+
+    assert sample_count == 200
+    assert frequencies[peak_index] == pytest.approx(5.0, abs=0.1)
+    assert nyquist_hz == pytest.approx(50.0)

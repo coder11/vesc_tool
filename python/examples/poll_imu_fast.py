@@ -46,7 +46,9 @@ DEFAULT_TIMEOUT = 0.1
 DEFAULT_STATUS_INTERVAL = 1.0
 DEFAULT_UI_RATE = 10.0
 DEFAULT_PLOT_RATE = 30.0
-DEFAULT_PLOT_HISTORY = 5000
+DEFAULT_FFT_RATE = 2.0
+DEFAULT_FFT_WINDOW = 2.0
+DEFAULT_PLOT_HISTORY = 20000
 DEFAULT_PLOT_MAX_POINTS = 1200
 DEFAULT_PLOT_PENDING = 20000
 PLOT_SAMPLE_BATCH = 64
@@ -753,6 +755,7 @@ class AxisPlotHistory:
             capacity,
             dtype=np_module.float64,
         )
+        self._write_index = 0
 
     @property
     def count(self) -> int:
@@ -762,17 +765,17 @@ class AxisPlotHistory:
     def latest_timestamp(self) -> float | None:
         if self._count == 0:
             return None
-        return float(self._timestamps[-1])
+        return float(self._timestamps[(self._write_index - 1) % self._capacity])
 
     def valid_timestamps(self) -> npt.NDArray[np.float64]:
         if self._count == 0:
             return self._timestamps[:0]
-        return self._timestamps[-self._count :]
+        return self._ordered_values(self._timestamps)
 
     def valid_values(self) -> npt.NDArray[np.float64]:
         if self._count == 0:
             return self._values[:0]
-        return self._values[-self._count :]
+        return self._ordered_values(self._values)
 
     def sample_hz(self) -> float | None:
         if self._count < 2:
@@ -798,13 +801,78 @@ class AxisPlotHistory:
             self._timestamps[:] = timestamps[-self._capacity :]
             self._values[:] = values[-self._capacity :]
             self._count = self._capacity
+            self._write_index = 0
             return
 
-        self._timestamps[:-sample_count] = self._timestamps[sample_count:]
-        self._timestamps[-sample_count:] = timestamps
-        self._values[:-sample_count] = self._values[sample_count:]
-        self._values[-sample_count:] = values
+        first_count = min(sample_count, self._capacity - self._write_index)
+        self._timestamps[self._write_index : self._write_index + first_count] = (
+            timestamps[:first_count]
+        )
+        self._values[self._write_index : self._write_index + first_count] = values[
+            :first_count
+        ]
+
+        remaining = sample_count - first_count
+        if remaining > 0:
+            self._timestamps[:remaining] = timestamps[first_count:]
+            self._values[:remaining] = values[first_count:]
+
+        self._write_index = (self._write_index + sample_count) % self._capacity
         self._count = min(self._capacity, self._count + sample_count)
+
+    def _ordered_values(
+        self,
+        source: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        np_module = import_numpy()
+        start = (self._write_index - self._count) % self._capacity
+        if start + self._count <= self._capacity:
+            return source[start : start + self._count]
+        return cast(
+            "npt.NDArray[np.float64]",
+            np_module.concatenate((source[start:], source[: self._write_index])),
+        )
+
+
+def axis_frequency_spectrum(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+    *,
+    window_s: float,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
+    """Return FFT frequency bins, magnitudes, Nyquist Hz, and sample count."""
+    if timestamps.size < 2:
+        return None
+
+    np_module = import_numpy()
+    window_start_s = float(timestamps[-1]) - window_s
+    start_index = int(np_module.searchsorted(timestamps, window_start_s, side="left"))
+    window_timestamps = timestamps[start_index:]
+    window_values = values[start_index:]
+    sample_count = int(window_timestamps.size)
+    if sample_count < 2:
+        return None
+
+    sample_periods = np_module.diff(window_timestamps)
+    sample_periods = sample_periods[sample_periods > 0.0]
+    if sample_periods.size == 0:
+        return None
+
+    sample_period = float(np_module.median(sample_periods))
+    if not math.isfinite(sample_period) or sample_period <= 0.0:
+        return None
+
+    centered = window_values - np_module.mean(window_values)
+    if sample_count > 2:
+        centered = centered * np_module.hanning(sample_count)
+
+    frequencies = np_module.fft.rfftfreq(sample_count, d=sample_period)
+    magnitudes = np_module.abs(np_module.fft.rfft(centered)) / sample_count
+    if magnitudes.size > 2:
+        magnitudes[1:-1] *= 2.0
+
+    nyquist_hz = 0.5 / sample_period
+    return frequencies, magnitudes, nyquist_hz, sample_count
 
 
 class FastImuAxisPoller:
@@ -1021,6 +1089,8 @@ def run_accel_axis_plot(
     history: int,
     max_points: int,
     plot_rate: float,
+    fft_window: float,
+    fft_rate: float,
     theme: str,
     antialias: bool,
 ) -> None:
@@ -1038,7 +1108,7 @@ def run_accel_axis_plot(
     app = pg.mkQApp("VESC Fast IMU Axis Plot")
     window = QtWidgets.QWidget()
     window.setWindowTitle("VESC Fast IMU Axis Plot")
-    window.resize(1000, 620)
+    window.resize(1400, 620)
     window.setStyleSheet(f"background-color: {selected_theme.window_background};")
 
     qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
@@ -1054,9 +1124,17 @@ def run_accel_axis_plot(
     layout.setContentsMargins(8, 8, 8, 8)
     layout.setSpacing(8)
     layout.addWidget(title)
-    plot_widget = pg.PlotWidget()
-    layout.addWidget(plot_widget, stretch=1)
+
+    plot_row = QtWidgets.QHBoxLayout()
+    plot_row.setContentsMargins(0, 0, 0, 0)
+    plot_row.setSpacing(8)
+    layout.addLayout(plot_row, stretch=1)
     layout.addWidget(status)
+
+    plot_widget = pg.PlotWidget(title="Time Series")
+    spectrum_widget = pg.PlotWidget(title="Frequency Analysis")
+    plot_row.addWidget(plot_widget, stretch=1)
+    plot_row.addWidget(spectrum_widget, stretch=1)
 
     plot = plot_widget.getPlotItem()
     plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
@@ -1083,9 +1161,28 @@ def run_accel_axis_plot(
     line.setSkipFiniteCheck(True)
     plot.addItem(line)
 
+    spectrum_plot = spectrum_widget.getPlotItem()
+    spectrum_plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
+    spectrum_plot.setLabel("left", "magnitude", units="g")
+    spectrum_plot.setLabel("bottom", "frequency", units="Hz")
+    spectrum_plot.setXRange(0.0, 1.0, padding=0.0)
+    spectrum_plot.setYRange(0.0, 1e-6, padding=0.0)
+    spectrum_line = pg.PlotCurveItem(
+        np_module.empty(0, dtype=np_module.float64),
+        np_module.empty(0, dtype=np_module.float64),
+        pen=pg.mkPen(selected_theme.line_color, width=1.2),
+        name=f"{axis_name} FFT",
+        connect="all",
+        skipFiniteCheck=True,
+    )
+    spectrum_line.setSkipFiniteCheck(True)
+    spectrum_plot.addItem(spectrum_line)
+
     plot_history = AxisPlotHistory(history)
     refresh_timestamps: deque[float] = deque(maxlen=120)
     dropped_pending = 0
+    latest_nyquist_hz: float | None = None
+    latest_fft_samples = 0
 
     def actual_plot_hz() -> float | None:
         if len(refresh_timestamps) < 2:
@@ -1128,6 +1225,34 @@ def run_accel_axis_plot(
         if x_values.size >= 2:
             plot.setXRange(float(x_values[0]), float(x_values[-1]), padding=0.0)
 
+    def refresh_spectrum() -> None:
+        nonlocal latest_nyquist_hz, latest_fft_samples
+
+        spectrum = axis_frequency_spectrum(
+            plot_history.valid_timestamps(),
+            plot_history.valid_values(),
+            window_s=fft_window,
+        )
+        if spectrum is None:
+            latest_nyquist_hz = None
+            latest_fft_samples = 0
+            return
+
+        frequencies, magnitudes, nyquist_hz, sample_count = spectrum
+        latest_nyquist_hz = nyquist_hz
+        latest_fft_samples = sample_count
+        spectrum_line.setData(
+            x=frequencies,
+            y=magnitudes,
+            connect="all",
+            skipFiniteCheck=True,
+        )
+
+        if frequencies.size > 0:
+            spectrum_plot.setXRange(0.0, float(frequencies[-1]), padding=0.0)
+        max_magnitude = float(np_module.max(magnitudes)) if magnitudes.size else 0.0
+        spectrum_plot.setYRange(0.0, max(max_magnitude * 1.1, 1e-9), padding=0.0)
+
     def refresh_status() -> None:
         snapshot = poller.snapshot()
         latest = (
@@ -1139,6 +1264,11 @@ def run_accel_axis_plot(
         sample_text = "measuring" if sample_hz is None else f"{sample_hz:.1f} Hz"
         plot_hz = actual_plot_hz()
         plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
+        fft_text = (
+            "FFT: measuring"
+            if latest_nyquist_hz is None
+            else f"FFT: {latest_fft_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
+        )
         error_text = (
             f" | error: {snapshot.last_error}"
             if snapshot.last_error is not None
@@ -1148,7 +1278,7 @@ def run_accel_axis_plot(
         status.setText(
             f"{state} | latest: {latest} | samples: {snapshot.samples} | "
             f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
-            f"plot: {plot_text} | timeouts: {snapshot.timeouts} | "
+            f"plot: {plot_text} | {fft_text} | timeouts: {snapshot.timeouts} | "
             f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
             f"dropped_ui: {dropped_pending}{error_text}"
         )
@@ -1157,20 +1287,27 @@ def run_accel_axis_plot(
     plot_timer.setInterval(round(1000.0 / plot_rate))
     plot_timer.timeout.connect(refresh_plot)
 
+    fft_timer = QtCore.QTimer()
+    fft_timer.setInterval(round(1000.0 / fft_rate))
+    fft_timer.timeout.connect(refresh_spectrum)
+
     status_timer = QtCore.QTimer()
     status_timer.setInterval(round(1000.0 / DEFAULT_STATUS_INTERVAL))
     status_timer.timeout.connect(refresh_status)
 
     def stop_updates(*_args: object) -> None:
         plot_timer.stop()
+        fft_timer.stop()
         status_timer.stop()
 
     window.destroyed.connect(stop_updates)
     refresh_plot()
+    refresh_spectrum()
     refresh_status()
     window.show()
     poller.start()
     plot_timer.start()
+    fft_timer.start()
     status_timer.start()
 
     exec_app = getattr(app, "exec", None)
@@ -1460,6 +1597,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Plot redraw rate in Hz (default: {DEFAULT_PLOT_RATE:g}).",
     )
     parser.add_argument(
+        "--fft-window",
+        type=float,
+        default=DEFAULT_FFT_WINDOW,
+        metavar="SEC",
+        help=f"Seconds of raw samples to keep in the FFT window (default: {DEFAULT_FFT_WINDOW:g}).",
+    )
+    parser.add_argument(
+        "--fft-rate",
+        type=float,
+        default=DEFAULT_FFT_RATE,
+        metavar="HZ",
+        help=f"Frequency plot redraw rate in Hz (default: {DEFAULT_FFT_RATE:g}).",
+    )
+    parser.add_argument(
         "--plot-pending",
         type=int,
         default=DEFAULT_PLOT_PENDING,
@@ -1534,6 +1685,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--plot-max-points must be greater than 0")
     if args.plot_rate <= 0.0:
         parser.error("--plot-rate must be greater than 0")
+    if args.fft_window <= 0.0:
+        parser.error("--fft-window must be greater than 0")
+    if args.fft_rate <= 0.0:
+        parser.error("--fft-rate must be greater than 0")
     if args.plot_pending <= 0:
         parser.error("--plot-pending must be greater than 0")
     if args.print_every < 0:
@@ -1608,6 +1763,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 history=args.plot_history,
                 max_points=args.plot_max_points,
                 plot_rate=args.plot_rate,
+                fft_window=args.fft_window,
+                fft_rate=args.fft_rate,
                 theme=args.theme,
                 antialias=args.antialias,
             )
