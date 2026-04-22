@@ -22,7 +22,7 @@ def test_signal_stats_handles_empty_values() -> None:
     assert stats is None
     assert (
         format_stats(stats, "g")
-        == "mean: n/a | std: n/a | RMS: n/a | peak-to-peak: n/a"
+        == "mean: n/a\nstd: n/a\nRMS: n/a\npeak-to-peak: n/a"
     )
 
 

@@ -237,14 +237,18 @@ def signal_stats(values: npt.NDArray[np.float64]) -> SignalStats | None:
 def format_stats(stats: SignalStats | None, unit: str) -> str:
     """Format optional signal metrics for status text."""
     if stats is None:
-        return (
-            "mean: n/a | std: n/a | RMS: n/a | "
-            "peak-to-peak: n/a"
+        return "\n".join(
+            (
+                "mean: n/a",
+                "std: n/a",
+                "RMS: n/a",
+                "peak-to-peak: n/a",
+            )
         )
     return (
-        f"mean: {stats.mean:.6g} {unit} | "
-        f"std: {stats.std:.6g} {unit} | "
-        f"RMS: {stats.rms:.6g} {unit} | "
+        f"mean: {stats.mean:.6g} {unit}\n"
+        f"std: {stats.std:.6g} {unit}\n"
+        f"RMS: {stats.rms:.6g} {unit}\n"
         f"peak-to-peak: {stats.peak_to_peak:.6g} {unit}"
     )
 
@@ -318,6 +322,13 @@ def run_signal_bench(
     clear_button = QtWidgets.QPushButton("Clear")
     controls.addWidget(clear_button)
     controls.addStretch(1)
+
+    metrics_text = QtWidgets.QLabel(format_stats(None, source.unit))
+    metrics_text.setAlignment(qt_alignment.AlignLeft)
+    metrics_text.setStyleSheet(
+        f"color: {selected_theme.text_color}; font-family: monospace;"
+    )
+    root.addWidget(metrics_text)
 
     plot_widget = pg.PlotWidget(title="Time Series")
     plot_widget.setMinimumSize(0, 0)
@@ -442,7 +453,7 @@ def run_signal_bench(
         latest_raw = float(raw_values[-1])
         latest_filtered = float(filtered_values[-1])
         latest_residual = float(residual_values[-1])
-        latest_stats = signal_stats(raw_values)
+        latest_stats = signal_stats(filtered_values)
 
         indexes = decimate_indexes(int(x_values.size), max_points)
         if indexes is not None:
@@ -487,11 +498,11 @@ def run_signal_bench(
             if snapshot.last_error is not None
             else ""
         )
+        metrics_text.setText(format_stats(latest_stats, source.unit))
         status.setText(
             f"{state} | raw: {format_value(latest_raw, source.unit)} | "
             f"filtered: {format_value(latest_filtered, source.unit)} | "
             f"residual: {format_value(latest_residual, source.unit)} | "
-            f"{format_stats(latest_stats, source.unit)} | "
             f"sma: {int(sma_spin.value())} | samples: {snapshot.samples} | "
             f"source avg: {snapshot.average_rate_hz:.1f} Hz | "
             f"history: {format_rate(history_hz)} | plot: {format_rate(plot_hz)} | "
