@@ -328,6 +328,53 @@ def signal_stats(values: npt.NDArray[np.float64]) -> SignalStats | None:
     )
 
 
+def signal_psd(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None:
+    """Return one-sided PSD bins for a scalar signal window."""
+    sample_count = int(min(timestamps.size, values.size))
+    if sample_count < 2:
+        return None
+
+    window_timestamps = timestamps[-sample_count:]
+    window_values = values[-sample_count:]
+    sample_periods = np.diff(window_timestamps)
+    sample_periods = sample_periods[sample_periods > 0.0]
+    if sample_periods.size == 0:
+        return None
+
+    sample_period = float(np.median(sample_periods))
+    if not np.isfinite(sample_period) or sample_period <= 0.0:
+        return None
+
+    sample_rate_hz = 1.0 / sample_period
+    window = np.hanning(sample_count)
+    if not np.any(window):
+        window = np.ones(sample_count, dtype=np.float64)
+
+    centered = window_values.astype(np.float64, copy=False) - float(
+        np.mean(window_values)
+    )
+    spectrum = np.fft.rfft(centered * window)
+    scale = sample_rate_hz * float(np.sum(window * window))
+    if scale <= 0.0:
+        return None
+
+    psd = (np.abs(spectrum) ** 2) / scale
+    if psd.size > 1:
+        if sample_count % 2 == 0:
+            psd[1:-1] *= 2.0
+        else:
+            psd[1:] *= 2.0
+
+    frequencies = cast(
+        "npt.NDArray[np.float64]",
+        np.fft.rfftfreq(sample_count, d=sample_period),
+    )
+    return frequencies, psd
+
+
 def format_stats(stats: SignalStats | None, unit: str) -> str:
     """Format optional signal metrics for status text."""
     if stats is None:
@@ -436,10 +483,17 @@ def run_signal_bench(
     )
     root.addWidget(metrics_text)
 
+    plot_row = QtWidgets.QHBoxLayout()
+    plot_row.setContentsMargins(0, 0, 0, 0)
+    plot_row.setSpacing(8)
+    root.addLayout(plot_row, stretch=1)
+
     plot_widget = pg.PlotWidget(title="Time Series")
-    plot_widget.setMinimumSize(0, 0)
-    plot_widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
-    root.addWidget(plot_widget, stretch=1)
+    spectrum_widget = pg.PlotWidget(title="PSD")
+    for widget in (plot_widget, spectrum_widget):
+        widget.setMinimumSize(0, 0)
+        widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
+        plot_row.addWidget(widget, stretch=1)
 
     status = QtWidgets.QLabel("Waiting for signal data...")
     status.setAlignment(qt_alignment.AlignLeft)
@@ -508,6 +562,49 @@ def run_signal_bench(
     zero_line.setVisible(False)
     plot.addItem(zero_line)
 
+    spectrum_plot = spectrum_widget.getPlotItem()
+    spectrum_plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
+    spectrum_plot.setLabel("left", "PSD", units=f"{source.unit}^2/Hz")
+    spectrum_plot.setLabel("bottom", "frequency", units="Hz")
+    spectrum_plot.setMouseEnabled(x=False, y=True)
+    spectrum_plot.setLimits(xMin=0.0, yMin=0.0)
+    for method_name, args in (
+        ("setClipToView", (True,)),
+        ("setDownsampling", (1, True, "peak")),
+    ):
+        method = getattr(spectrum_plot, method_name, None)
+        if method is not None:
+            method(*args)
+
+    raw_psd_line = pg.PlotCurveItem(
+        empty,
+        empty,
+        pen=pg.mkPen(selected_theme.line_colors[0], width=1.3),
+        name="Raw PSD",
+        connect="all",
+        skipFiniteCheck=True,
+    )
+    filtered_psd_line = pg.PlotCurveItem(
+        empty,
+        empty,
+        pen=pg.mkPen(selected_theme.line_colors[1], width=1.6),
+        name="Filtered PSD",
+        connect="all",
+        skipFiniteCheck=True,
+    )
+    residual_psd_line = pg.PlotCurveItem(
+        empty,
+        empty,
+        pen=pg.mkPen(selected_theme.line_colors[2], width=1.4),
+        name="Residual PSD",
+        connect="all",
+        skipFiniteCheck=True,
+    )
+    for line in (raw_psd_line, filtered_psd_line, residual_psd_line):
+        line.setSkipFiniteCheck(True)
+        spectrum_plot.addItem(line)
+    spectrum_legend = spectrum_plot.addLegend(offset=(10, 10))
+
     signal_history = SignalRingHistory(history)
     refresh_timestamps: deque[float] = deque(maxlen=120)
     dropped_pending = 0
@@ -537,15 +634,50 @@ def run_signal_bench(
         latest_filter_sample_rate_hz = None
         latest_filter_cutoff = None
         latest_effective_cutoff_hz = None
-        for line in (raw_line, filtered_line, residual_line):
+        for line in (
+            raw_line,
+            filtered_line,
+            residual_line,
+            raw_psd_line,
+            filtered_psd_line,
+            residual_psd_line,
+        ):
             line.setData(x=empty, y=empty, connect="all", skipFiniteCheck=True)
 
     def set_visible_lines(mode_name: str) -> None:
         raw_line.setVisible(mode_name in ("raw", "both"))
         filtered_line.setVisible(mode_name in ("filtered", "both"))
         residual_line.setVisible(mode_name == "residual")
+        raw_psd_line.setVisible(mode_name in ("raw", "both"))
+        filtered_psd_line.setVisible(mode_name in ("filtered", "both"))
+        residual_psd_line.setVisible(mode_name == "residual")
         zero_line.setVisible(mode_name == "residual")
         legend.setVisible(mode_name == "both")
+        spectrum_legend.setVisible(mode_name == "both")
+
+    def set_psd_data(
+        line: Any,
+        timestamps: npt.NDArray[np.float64],
+        values: npt.NDArray[np.float64],
+    ) -> float | None:
+        psd_data = signal_psd(timestamps, values)
+        if psd_data is None:
+            line.setData(x=empty, y=empty, connect="all", skipFiniteCheck=True)
+            return None
+
+        frequencies, psd_values = psd_data
+        indexes = decimate_indexes(int(frequencies.size), max_points)
+        if indexes is not None:
+            frequencies = frequencies[indexes]
+            psd_values = psd_values[indexes]
+
+        line.setData(
+            x=frequencies,
+            y=psd_values,
+            connect="all",
+            skipFiniteCheck=True,
+        )
+        return float(frequencies[-1]) if frequencies.size > 0 else None
 
     def refresh_plot() -> None:
         nonlocal dropped_pending, latest_raw, latest_filtered, latest_residual, latest_stats
@@ -563,6 +695,7 @@ def run_signal_bench(
             set_visible_lines(selected_mode())
             return
 
+        timestamps_values = signal_history.valid_timestamps()
         x_values = history_axis_values(int(raw_values.size), history)
         snapshot = source.snapshot()
         sample_rate_hz = signal_history.sample_hz()
@@ -625,6 +758,28 @@ def run_signal_bench(
             connect="all",
             skipFiniteCheck=True,
         )
+        raw_nyquist = set_psd_data(raw_psd_line, timestamps_values, raw_values)
+        filtered_nyquist = set_psd_data(
+            filtered_psd_line,
+            timestamps_values,
+            filtered_values,
+        )
+        residual_nyquist = set_psd_data(
+            residual_psd_line,
+            timestamps_values,
+            residual_values,
+        )
+        nyquist_values = (
+            value
+            for value in (raw_nyquist, filtered_nyquist, residual_nyquist)
+            if value is not None
+        )
+        nyquist_hz = max(
+            nyquist_values,
+            default=None,
+        )
+        if nyquist_hz is not None and nyquist_hz > 0.0:
+            spectrum_plot.setXRange(0.0, nyquist_hz, padding=0.0)
         set_visible_lines(selected_mode())
         plot.setXRange(0.0, float(history), padding=0.0)
 
