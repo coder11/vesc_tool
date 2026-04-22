@@ -2,7 +2,7 @@
 """Live one-axis IMU signal bench for software filter tuning.
 
 Examples:
-    python examples/imu_signal_bench.py --source deterministic --axis acc_z --biquad-cutoff-hz 8
+    python examples/imu_signal_bench.py --source deterministic --axis acc_z --filter sma
     python examples/imu_signal_bench.py --source vesc --axis acc_z --pipeline-depth 4
 """
 
@@ -37,8 +37,12 @@ from vesc_py.live_signal import (
     SignalRingHistory,
     SignalSource,
     residual,
+    trailing_sma,
 )
 
+DEFAULT_FILTER = "biquad"
+DEFAULT_SMA_WINDOW = 10
+DEFAULT_FIR_TAPS = 31
 DEFAULT_HISTORY = 20000
 DEFAULT_MAX_POINTS = 1200
 DEFAULT_PLOT_RATE = 30.0
@@ -48,8 +52,17 @@ DEFAULT_BIQUAD_NORMALIZED_CUTOFF = 0.0159
 DEFAULT_BIQUAD_CUTOFF_HZ = (
     DEFAULT_BIQUAD_NORMALIZED_CUTOFF * DEFAULT_DETERMINISTIC_RATE
 )
+DEFAULT_FILTER_CUTOFF_HZ = DEFAULT_BIQUAD_CUTOFF_HZ
 DEFAULT_BIQUAD_SHAPE = 0.707
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+
+FILTER_LABELS = {
+    "biquad": "Biquad IIR LPF",
+    "one_pole": "One-pole IIR LPF",
+    "fir": "Windowed FIR LPF",
+    "sma": "SMA",
+}
+FILTER_CHOICES = tuple(FILTER_LABELS)
 
 
 class PlotTheme:
@@ -276,16 +289,18 @@ def normalized_biquad_cutoff(cutoff_hz: float, sample_rate_hz: float) -> float:
     return cutoff
 
 
-def biquad_reset(biquad: Biquad) -> None:
-    """Reset a biquad's delay state."""
-    biquad.z1 = 0.0
-    biquad.z2 = 0.0
+def biquad_reset(biquad: Biquad, initial_value: float = 0.0) -> None:
+    """Reset a biquad's delay state for a steady initial input."""
+    biquad.z1 = initial_value * (1.0 - biquad.a0)
+    biquad.z2 = initial_value * (biquad.a2 - biquad.b2)
 
 
 def biquad_lowpass(
     values: npt.NDArray[np.float64],
     cutoff: float,
     shape: float,
+    *,
+    initial_value: float = 0.0,
 ) -> npt.NDArray[np.float64]:
     """Return values filtered by a causal low-pass biquad."""
     if values.size == 0:
@@ -293,7 +308,7 @@ def biquad_lowpass(
 
     biquad = Biquad()
     biquad_config_lowpass(biquad, cutoff, shape)
-    biquad_reset(biquad)
+    biquad_reset(biquad, initial_value)
 
     raw = values.astype(np.float64, copy=False)
     filtered = np.empty(raw.shape, dtype=np.float64)
@@ -307,13 +322,86 @@ def biquad_lowpass_hz(
     cutoff_hz: float,
     sample_rate_hz: float,
     shape: float,
+    *,
+    initial_value: float = 0.0,
 ) -> npt.NDArray[np.float64]:
     """Return values filtered by a causal low-pass biquad using cutoff in Hz."""
     return biquad_lowpass(
         values,
         normalized_biquad_cutoff(cutoff_hz, sample_rate_hz),
         shape,
+        initial_value=initial_value,
     )
+
+
+def one_pole_lowpass_hz(
+    values: npt.NDArray[np.float64],
+    cutoff_hz: float,
+    sample_rate_hz: float,
+    *,
+    initial_value: float = 0.0,
+) -> npt.NDArray[np.float64]:
+    """Return values filtered by a causal one-pole low-pass IIR."""
+    normalized_biquad_cutoff(cutoff_hz, sample_rate_hz)
+    if values.size == 0:
+        return np.empty(0, dtype=np.float64)
+
+    alpha = 1.0 - math.exp(-2.0 * math.pi * cutoff_hz / sample_rate_hz)
+    raw = values.astype(np.float64, copy=False)
+    filtered = np.empty(raw.shape, dtype=np.float64)
+    state = initial_value
+    for index, value in enumerate(raw):
+        state += alpha * (float(value) - state)
+        filtered[index] = state
+    return filtered
+
+
+def fir_lowpass_coefficients(
+    cutoff_hz: float,
+    sample_rate_hz: float,
+    taps: int,
+) -> npt.NDArray[np.float64]:
+    """Return Hamming-windowed sinc low-pass FIR coefficients."""
+    if taps <= 0:
+        raise ValueError("taps must be greater than 0")
+
+    normalized_cutoff = normalized_biquad_cutoff(cutoff_hz, sample_rate_hz)
+    sample_indexes = np.arange(taps, dtype=np.float64)
+    center = (float(taps) - 1.0) / 2.0
+    coefficients = (
+        2.0
+        * normalized_cutoff
+        * np.sinc(2.0 * normalized_cutoff * (sample_indexes - center))
+    )
+    coefficients *= np.hamming(taps)
+    coefficient_sum = float(np.sum(coefficients))
+    if coefficient_sum == 0.0:
+        raise ValueError("FIR coefficient sum is zero")
+    return coefficients / coefficient_sum
+
+
+def fir_lowpass_hz(
+    values: npt.NDArray[np.float64],
+    cutoff_hz: float,
+    sample_rate_hz: float,
+    taps: int,
+    *,
+    pad_initial: bool = False,
+) -> npt.NDArray[np.float64]:
+    """Return values filtered by a causal windowed-sinc low-pass FIR."""
+    if values.size == 0:
+        return np.empty(0, dtype=np.float64)
+
+    coefficients = fir_lowpass_coefficients(cutoff_hz, sample_rate_hz, taps)
+    raw = values.astype(np.float64, copy=False)
+    sample_count = int(raw.size)
+    if pad_initial and coefficients.size > 1:
+        raw = np.pad(raw, (coefficients.size - 1, 0), mode="edge")
+        start = int(coefficients.size - 1)
+    else:
+        start = 0
+    filtered = np.convolve(raw, coefficients, mode="full")
+    return filtered[start : start + sample_count]
 
 
 def signal_stats(values: npt.NDArray[np.float64]) -> SignalStats | None:
@@ -398,8 +486,11 @@ def run_signal_bench(
     source: SignalSource,
     *,
     source_label: str,
-    initial_biquad_cutoff_hz: float,
+    initial_filter: str,
+    initial_filter_cutoff_hz: float,
     initial_biquad_shape: float,
+    initial_sma_window: int,
+    initial_fir_taps: int,
     history: int,
     max_points: int,
     plot_rate: float,
@@ -443,22 +534,46 @@ def run_signal_bench(
     controls.addWidget(axis_text)
 
     controls.addSpacing(12)
-    controls.addWidget(QtWidgets.QLabel("Biquad LP"))
-    controls.addWidget(QtWidgets.QLabel("Cutoff Hz"))
+    controls.addWidget(QtWidgets.QLabel("Filter"))
+    filter_combo = QtWidgets.QComboBox()
+    for filter_name, label in FILTER_LABELS.items():
+        filter_combo.addItem(label, filter_name)
+    initial_filter_index = filter_combo.findData(initial_filter)
+    filter_combo.setCurrentIndex(max(0, initial_filter_index))
+    controls.addWidget(filter_combo)
+
+    cutoff_label = QtWidgets.QLabel("Cutoff Hz")
+    controls.addWidget(cutoff_label)
     cutoff_spin = QtWidgets.QDoubleSpinBox()
     cutoff_spin.setRange(0.001, 100000.0)
     cutoff_spin.setDecimals(3)
     cutoff_spin.setSingleStep(0.5)
-    cutoff_spin.setValue(initial_biquad_cutoff_hz)
+    cutoff_spin.setValue(initial_filter_cutoff_hz)
     controls.addWidget(cutoff_spin)
 
-    controls.addWidget(QtWidgets.QLabel("Shape (Q)"))
+    shape_label = QtWidgets.QLabel("Q")
+    controls.addWidget(shape_label)
     shape_spin = QtWidgets.QDoubleSpinBox()
     shape_spin.setRange(0.05, 10.0)
     shape_spin.setDecimals(3)
     shape_spin.setSingleStep(0.05)
     shape_spin.setValue(initial_biquad_shape)
     controls.addWidget(shape_spin)
+
+    sma_label = QtWidgets.QLabel("SMA")
+    controls.addWidget(sma_label)
+    sma_spin = QtWidgets.QSpinBox()
+    sma_spin.setRange(1, 100000)
+    sma_spin.setValue(initial_sma_window)
+    controls.addWidget(sma_spin)
+
+    fir_taps_label = QtWidgets.QLabel("FIR taps")
+    controls.addWidget(fir_taps_label)
+    fir_taps_spin = QtWidgets.QSpinBox()
+    fir_taps_spin.setRange(1, 10001)
+    fir_taps_spin.setSingleStep(2)
+    fir_taps_spin.setValue(initial_fir_taps)
+    controls.addWidget(fir_taps_spin)
 
     mode_group = QtWidgets.QButtonGroup(window)
     mode_group.setExclusive(True)
@@ -612,9 +727,11 @@ def run_signal_bench(
     latest_filtered: float | None = None
     latest_residual: float | None = None
     latest_stats: SignalStats | None = None
-    latest_filter_sample_rate_hz: float | None = None
-    latest_filter_cutoff: float | None = None
-    latest_effective_cutoff_hz: float | None = None
+    initial_filter_label = FILTER_LABELS.get(
+        initial_filter,
+        FILTER_LABELS[DEFAULT_FILTER],
+    )
+    latest_filter_status = f"{initial_filter_label}: n/a"
 
     def selected_mode() -> str:
         for mode_name, button in mode_buttons.items():
@@ -622,18 +739,36 @@ def run_signal_bench(
                 return mode_name
         return "both"
 
+    def selected_filter() -> str:
+        filter_name = filter_combo.currentData()
+        if isinstance(filter_name, str) and filter_name in FILTER_LABELS:
+            return filter_name
+        return DEFAULT_FILTER
+
+    def update_filter_controls() -> None:
+        filter_name = selected_filter()
+        uses_cutoff = filter_name in ("biquad", "one_pole", "fir")
+        uses_shape = filter_name == "biquad"
+        uses_sma = filter_name == "sma"
+        uses_fir = filter_name == "fir"
+        for widget in (cutoff_label, cutoff_spin):
+            widget.setVisible(uses_cutoff)
+        for widget in (shape_label, shape_spin):
+            widget.setVisible(uses_shape)
+        for widget in (sma_label, sma_spin):
+            widget.setVisible(uses_sma)
+        for widget in (fir_taps_label, fir_taps_spin):
+            widget.setVisible(uses_fir)
+
     def clear_history() -> None:
         nonlocal latest_raw, latest_filtered, latest_residual, latest_stats
-        nonlocal latest_filter_sample_rate_hz, latest_filter_cutoff
-        nonlocal latest_effective_cutoff_hz
+        nonlocal latest_filter_status
         signal_history.clear()
         latest_raw = None
         latest_filtered = None
         latest_residual = None
         latest_stats = None
-        latest_filter_sample_rate_hz = None
-        latest_filter_cutoff = None
-        latest_effective_cutoff_hz = None
+        latest_filter_status = f"{FILTER_LABELS[selected_filter()]}: n/a"
         for line in (
             raw_line,
             filtered_line,
@@ -680,9 +815,8 @@ def run_signal_bench(
         return float(frequencies[-1]) if frequencies.size > 0 else None
 
     def refresh_plot() -> None:
-        nonlocal dropped_pending, latest_raw, latest_filtered, latest_residual, latest_stats
-        nonlocal latest_filter_sample_rate_hz, latest_filter_cutoff
-        nonlocal latest_effective_cutoff_hz
+        nonlocal dropped_pending, latest_raw, latest_filtered, latest_residual
+        nonlocal latest_stats, latest_filter_status
 
         timestamps, values, dropped = source.drain()
         dropped_pending += dropped
@@ -702,26 +836,62 @@ def run_signal_bench(
         if sample_rate_hz is None and snapshot.average_rate_hz > 0.0:
             sample_rate_hz = snapshot.average_rate_hz
 
-        if sample_rate_hz is None:
+        filter_name = selected_filter()
+        if filter_name == "sma":
+            sma_window = int(sma_spin.value())
+            filtered_values = trailing_sma(raw_values, sma_window)
+            latest_filter_status = f"{FILTER_LABELS[filter_name]} window: {sma_window}"
+        elif sample_rate_hz is None:
             filtered_values = raw_values.astype(np.float64, copy=True)
-            latest_filter_sample_rate_hz = None
-            latest_filter_cutoff = None
-            latest_effective_cutoff_hz = None
+            latest_filter_status = (
+                f"{FILTER_LABELS[filter_name]}: waiting for sample rate"
+            )
         else:
+            initial_filter_value = float(raw_values[0])
             cutoff_hz = float(cutoff_spin.value())
             effective_cutoff_hz = min(cutoff_hz, sample_rate_hz * 0.499)
-            filtered_values = biquad_lowpass_hz(
-                raw_values,
+            if filter_name == "biquad":
+                filter_extra = f" | Q: {float(shape_spin.value()):.3g}"
+                filtered_values = biquad_lowpass_hz(
+                    raw_values,
+                    effective_cutoff_hz,
+                    sample_rate_hz,
+                    float(shape_spin.value()),
+                    initial_value=initial_filter_value,
+                )
+            elif filter_name == "one_pole":
+                filter_extra = ""
+                filtered_values = one_pole_lowpass_hz(
+                    raw_values,
+                    effective_cutoff_hz,
+                    sample_rate_hz,
+                    initial_value=initial_filter_value,
+                )
+            else:
+                fir_taps = int(fir_taps_spin.value())
+                filter_extra = f" | taps: {fir_taps}"
+                filtered_values = fir_lowpass_hz(
+                    raw_values,
+                    effective_cutoff_hz,
+                    sample_rate_hz,
+                    fir_taps,
+                    pad_initial=True,
+                )
+            normalized_cutoff = normalized_biquad_cutoff(
                 effective_cutoff_hz,
                 sample_rate_hz,
-                float(shape_spin.value()),
             )
-            latest_filter_sample_rate_hz = sample_rate_hz
-            latest_filter_cutoff = normalized_biquad_cutoff(
-                effective_cutoff_hz,
-                sample_rate_hz,
+            cutoff_text = f"{cutoff_hz:.3g} Hz"
+            if effective_cutoff_hz < cutoff_hz:
+                cutoff_text = (
+                    f"{cutoff_hz:.3g} Hz "
+                    f"(effective {effective_cutoff_hz:.3g} Hz)"
+                )
+            latest_filter_status = (
+                f"{FILTER_LABELS[filter_name]} cutoff: {cutoff_text} | "
+                f"Fc: {normalized_cutoff:.5g} | "
+                f"sample: {format_rate(sample_rate_hz)}{filter_extra}"
             )
-            latest_effective_cutoff_hz = effective_cutoff_hz
         residual_values = residual(raw_values, filtered_values)
         latest_raw = float(raw_values[-1])
         latest_filtered = float(filtered_values[-1])
@@ -794,29 +964,11 @@ def run_signal_bench(
             else ""
         )
         metrics_text.setText(format_stats(latest_stats, source.unit))
-        filter_rate_text = format_rate(latest_filter_sample_rate_hz)
-        normalized_cutoff_text = (
-            "measuring"
-            if latest_filter_cutoff is None
-            else f"{latest_filter_cutoff:.5g}"
-        )
-        requested_cutoff_hz = float(cutoff_spin.value())
-        cutoff_text = f"{requested_cutoff_hz:.3g} Hz"
-        if (
-            latest_effective_cutoff_hz is not None
-            and latest_effective_cutoff_hz < requested_cutoff_hz
-        ):
-            cutoff_text = (
-                f"{requested_cutoff_hz:.3g} Hz "
-                f"(effective {latest_effective_cutoff_hz:.3g} Hz)"
-            )
         status.setText(
             f"{state} | raw: {format_value(latest_raw, source.unit)} | "
             f"filtered: {format_value(latest_filtered, source.unit)} | "
             f"residual: {format_value(latest_residual, source.unit)} | "
-            f"biquad LP cutoff: {cutoff_text} | "
-            f"Fc: {normalized_cutoff_text} | filter sample: {filter_rate_text} | "
-            f"Q: {float(shape_spin.value()):.3g} | samples: {snapshot.samples} | "
+            f"filter: {latest_filter_status} | samples: {snapshot.samples} | "
             f"source avg: {snapshot.average_rate_hz:.1f} Hz | "
             f"history: {format_rate(history_hz)} | plot: {format_rate(plot_hz)} | "
             f"dropped: {snapshot.dropped + dropped_pending} | errors: {snapshot.errors}"
@@ -836,10 +988,14 @@ def run_signal_bench(
         status_timer.stop()
 
     clear_button.clicked.connect(clear_history)
+    filter_combo.currentIndexChanged.connect(lambda _index=0: update_filter_controls())
     for button in mode_buttons.values():
-        button.clicked.connect(lambda _checked=False: set_visible_lines(selected_mode()))
+        button.clicked.connect(
+            lambda _checked=False: set_visible_lines(selected_mode())
+        )
     window.destroyed.connect(stop_updates)
 
+    update_filter_controls()
     set_visible_lines("both")
     refresh_plot()
     refresh_status()
@@ -903,15 +1059,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"IMU axis to capture. Valid: {', '.join(IMU_BENCH_FIELDS)}.",
     )
     parser.add_argument(
+        "--filter",
+        choices=FILTER_CHOICES,
+        default=DEFAULT_FILTER,
+        help=f"Initial filter to apply (default: {DEFAULT_FILTER}).",
+    )
+    parser.add_argument(
+        "--filter-cutoff-hz",
         "--biquad-cutoff-hz",
+        dest="filter_cutoff_hz",
         type=float,
-        default=DEFAULT_BIQUAD_CUTOFF_HZ,
+        default=DEFAULT_FILTER_CUTOFF_HZ,
         metavar="HZ",
         help=(
-            "Initial low-pass biquad cutoff in Hz "
-            f"(default: {DEFAULT_BIQUAD_CUTOFF_HZ:g}; equivalent to "
+            "Initial low-pass cutoff in Hz for cutoff-based filters "
+            f"(default: {DEFAULT_FILTER_CUTOFF_HZ:g}; equivalent to "
             f"Fc={DEFAULT_BIQUAD_NORMALIZED_CUTOFF:g} at "
-            f"{DEFAULT_DETERMINISTIC_RATE:g} Hz)."
+            f"{DEFAULT_DETERMINISTIC_RATE:g} Hz). The --biquad-cutoff-hz "
+            "alias is kept for existing command lines."
         ),
     )
     parser.add_argument(
@@ -923,6 +1088,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Initial low-pass biquad shape/Q "
             f"(default: {DEFAULT_BIQUAD_SHAPE:g})."
         ),
+    )
+    parser.add_argument(
+        "--sma-window",
+        type=int,
+        default=DEFAULT_SMA_WINDOW,
+        metavar="N",
+        help=f"Initial SMA sample window (default: {DEFAULT_SMA_WINDOW}).",
+    )
+    parser.add_argument(
+        "--fir-taps",
+        type=int,
+        default=DEFAULT_FIR_TAPS,
+        metavar="N",
+        help=f"Initial FIR tap count (default: {DEFAULT_FIR_TAPS}).",
     )
     parser.add_argument(
         "--history",
@@ -992,10 +1171,14 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--timeout must be greater than 0")
     if args.pipeline_depth <= 0:
         parser.error("--pipeline-depth must be greater than 0")
-    if args.biquad_cutoff_hz <= 0.0:
-        parser.error("--biquad-cutoff-hz must be greater than 0")
+    if args.filter_cutoff_hz <= 0.0:
+        parser.error("--filter-cutoff-hz must be greater than 0")
     if args.biquad_shape <= 0.0:
         parser.error("--biquad-shape must be greater than 0")
+    if args.sma_window <= 0:
+        parser.error("--sma-window must be greater than 0")
+    if args.fir_taps <= 0:
+        parser.error("--fir-taps must be greater than 0")
     if args.history <= 0:
         parser.error("--history must be greater than 0")
     if args.max_points <= 0:
@@ -1046,8 +1229,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_signal_bench(
         source,
         source_label=source_label,
-        initial_biquad_cutoff_hz=cast(float, args.biquad_cutoff_hz),
+        initial_filter=cast(str, args.filter),
+        initial_filter_cutoff_hz=cast(float, args.filter_cutoff_hz),
         initial_biquad_shape=cast(float, args.biquad_shape),
+        initial_sma_window=cast(int, args.sma_window),
+        initial_fir_taps=cast(int, args.fir_taps),
         history=cast(int, args.history),
         max_points=cast(int, args.max_points),
         plot_rate=cast(float, args.plot_rate),

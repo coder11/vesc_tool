@@ -8,8 +8,11 @@ from examples.imu_signal_bench import (
     biquad_config_lowpass,
     biquad_lowpass,
     biquad_lowpass_hz,
+    fir_lowpass_coefficients,
+    fir_lowpass_hz,
     format_stats,
     normalized_biquad_cutoff,
+    one_pole_lowpass_hz,
     prefer_qt_xcb_platform,
     signal_psd,
     signal_stats,
@@ -52,6 +55,20 @@ def test_biquad_lowpass_filters_impulse_causally() -> None:
     )
 
 
+def test_biquad_lowpass_can_start_from_steady_initial_value() -> None:
+    values = np.full(8, 3.0, dtype=np.float64)
+
+    filtered = biquad_lowpass_hz(
+        values,
+        cutoff_hz=50.0,
+        sample_rate_hz=1000.0,
+        shape=0.707,
+        initial_value=float(values[0]),
+    )
+
+    np.testing.assert_allclose(filtered, values)
+
+
 def test_normalized_biquad_cutoff_uses_sample_rate() -> None:
     assert normalized_biquad_cutoff(
         cutoff_hz=15.9,
@@ -67,6 +84,87 @@ def test_biquad_lowpass_rejects_invalid_params() -> None:
 
     with pytest.raises(ValueError, match="shape"):
         biquad_lowpass(values, cutoff=0.1, shape=0.0)
+
+
+def test_one_pole_lowpass_filters_impulse_causally() -> None:
+    values = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    filtered = one_pole_lowpass_hz(
+        values,
+        cutoff_hz=250.0,
+        sample_rate_hz=1000.0,
+    )
+
+    alpha = 1.0 - np.exp(-2.0 * np.pi * 250.0 / 1000.0)
+    np.testing.assert_allclose(
+        filtered,
+        np.array(
+            [
+                alpha,
+                alpha * (1.0 - alpha),
+                alpha * (1.0 - alpha) ** 2,
+            ],
+            dtype=np.float64,
+        ),
+    )
+
+
+def test_one_pole_lowpass_can_start_from_steady_initial_value() -> None:
+    values = np.full(8, 3.0, dtype=np.float64)
+
+    filtered = one_pole_lowpass_hz(
+        values,
+        cutoff_hz=50.0,
+        sample_rate_hz=1000.0,
+        initial_value=float(values[0]),
+    )
+
+    np.testing.assert_allclose(filtered, values)
+
+
+def test_fir_lowpass_coefficients_are_normalized() -> None:
+    coefficients = fir_lowpass_coefficients(
+        cutoff_hz=25.0,
+        sample_rate_hz=100.0,
+        taps=11,
+    )
+
+    assert coefficients.size == 11
+    assert float(np.sum(coefficients)) == pytest.approx(1.0)
+    np.testing.assert_allclose(coefficients, coefficients[::-1])
+
+
+def test_fir_lowpass_filters_causally() -> None:
+    values = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    coefficients = fir_lowpass_coefficients(
+        cutoff_hz=25.0,
+        sample_rate_hz=100.0,
+        taps=3,
+    )
+
+    filtered = fir_lowpass_hz(
+        values,
+        cutoff_hz=25.0,
+        sample_rate_hz=100.0,
+        taps=3,
+    )
+
+    expected = np.concatenate((coefficients, np.array([0.0], dtype=np.float64)))
+    np.testing.assert_allclose(filtered, expected)
+
+
+def test_fir_lowpass_can_pad_initial_value() -> None:
+    values = np.full(8, 3.0, dtype=np.float64)
+
+    filtered = fir_lowpass_hz(
+        values,
+        cutoff_hz=50.0,
+        sample_rate_hz=1000.0,
+        taps=11,
+        pad_initial=True,
+    )
+
+    np.testing.assert_allclose(filtered, values)
 
 
 def test_signal_stats_returns_window_metrics() -> None:
