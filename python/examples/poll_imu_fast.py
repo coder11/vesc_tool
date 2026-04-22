@@ -56,6 +56,8 @@ DEFAULT_PLOT_MAX_POINTS = 1200
 DEFAULT_PLOT_PENDING = 20000
 DEFAULT_APPCONF_TIMEOUT = 1.0
 DEFAULT_APPCONF_FW_RETRIES = 25
+WELCH_TARGET_AVERAGES = 8
+WELCH_MIN_SEGMENT_SAMPLES = 8
 APPCONF_LIVE_APPLY_DELAY_MS = 200
 APPCONF_NON_LIVE_PARAMS = frozenset({"imu_conf.filter"})
 PLOT_SAMPLE_BATCH = 64
@@ -1181,19 +1183,84 @@ class ImuPlotHistory:
 
 @dataclass
 class FrequencyAxisRange:
-    """Track frequency plot bounds so ranges are not forced every FFT."""
+    """Track frequency plot bounds so ranges are not forced every PSD refresh."""
 
     x_max: float = 0.0
     y_max: float = 0.0
 
 
-def axis_frequency_spectrum(
+def _welch_segment_length(sample_count: int) -> int:
+    if sample_count < WELCH_MIN_SEGMENT_SAMPLES * 2:
+        return sample_count
+
+    target_segments = min(
+        WELCH_TARGET_AVERAGES,
+        max(1, sample_count // WELCH_MIN_SEGMENT_SAMPLES),
+    )
+    if target_segments <= 1:
+        return sample_count
+
+    segment_length = int((2 * sample_count) / (target_segments + 1))
+    return min(sample_count, max(WELCH_MIN_SEGMENT_SAMPLES, segment_length))
+
+
+def _welch_psd(
+    samples: npt.NDArray[np.float64],
+    *,
+    sample_period: float,
+    axis: int,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Return one-sided Welch PSD for samples along *axis*."""
+    np_module = import_numpy()
+    sample_count = int(samples.shape[axis])
+    segment_length = _welch_segment_length(sample_count)
+    step = max(1, segment_length // 2)
+    window = np_module.hanning(segment_length)
+    if not np_module.any(window):
+        window = np_module.ones(segment_length, dtype=np_module.float64)
+    window_shape = [1] * samples.ndim
+    window_shape[axis] = segment_length
+    shaped_window = window.reshape(tuple(window_shape))
+    sample_rate_hz = 1.0 / sample_period
+    scale = sample_rate_hz * float(np_module.sum(window * window))
+
+    segment_psds: list[npt.NDArray[np.float64]] = []
+    for start in range(0, sample_count - segment_length + 1, step):
+        segment = np_module.take(
+            samples,
+            np_module.arange(start, start + segment_length),
+            axis=axis,
+        )
+        segment = segment - np_module.mean(segment, axis=axis, keepdims=True)
+        segment = segment * shaped_window
+        spectrum = np_module.fft.rfft(segment, axis=axis)
+        psd = (np_module.abs(spectrum) ** 2) / scale
+        if psd.shape[axis] > 1:
+            multiplier = np_module.ones(psd.shape[axis], dtype=np_module.float64)
+            if segment_length % 2 == 0:
+                multiplier[1:-1] = 2.0
+            else:
+                multiplier[1:] = 2.0
+            multiplier_shape = [1] * psd.ndim
+            multiplier_shape[axis] = psd.shape[axis]
+            psd = psd * multiplier.reshape(tuple(multiplier_shape))
+        segment_psds.append(cast("npt.NDArray[np.float64]", psd))
+
+    frequencies = cast(
+        "npt.NDArray[np.float64]",
+        np_module.fft.rfftfreq(segment_length, d=sample_period),
+    )
+    psd_mean = cast("npt.NDArray[np.float64]", np_module.mean(segment_psds, axis=0))
+    return frequencies, psd_mean
+
+
+def axis_frequency_psd(
     timestamps: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
     *,
     window_s: float,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
-    """Return FFT frequency bins, magnitudes, Nyquist Hz, and sample count."""
+    """Return Welch PSD frequency bins, densities, Nyquist Hz, and sample count."""
     if timestamps.size < 2:
         return None
 
@@ -1215,26 +1282,18 @@ def axis_frequency_spectrum(
     if not math.isfinite(sample_period) or sample_period <= 0.0:
         return None
 
-    centered = window_values - np_module.mean(window_values)
-    if sample_count > 2:
-        centered = centered * np_module.hanning(sample_count)
-
-    frequencies = np_module.fft.rfftfreq(sample_count, d=sample_period)
-    magnitudes = np_module.abs(np_module.fft.rfft(centered)) / sample_count
-    if magnitudes.size > 2:
-        magnitudes[1:-1] *= 2.0
-
+    frequencies, psd = _welch_psd(window_values, sample_period=sample_period, axis=0)
     nyquist_hz = 0.5 / sample_period
-    return frequencies, magnitudes, nyquist_hz, sample_count
+    return frequencies, psd, nyquist_hz, sample_count
 
 
-def imu_frequency_spectrum(
+def imu_frequency_psd(
     timestamps: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
     *,
     window_s: float,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
-    """Return FFT bins and channel magnitudes for the recent IMU window."""
+    """Return Welch PSD bins and channel densities for the recent IMU window."""
     if timestamps.size < 2:
         return None
 
@@ -1256,17 +1315,9 @@ def imu_frequency_spectrum(
     if not math.isfinite(sample_period) or sample_period <= 0.0:
         return None
 
-    centered = window_values - np_module.mean(window_values, axis=1, keepdims=True)
-    if sample_count > 2:
-        centered = centered * np_module.hanning(sample_count)
-
-    frequencies = np_module.fft.rfftfreq(sample_count, d=sample_period)
-    magnitudes = np_module.abs(np_module.fft.rfft(centered, axis=1)) / sample_count
-    if magnitudes.shape[1] > 2:
-        magnitudes[:, 1:-1] *= 2.0
-
+    frequencies, psd = _welch_psd(window_values, sample_period=sample_period, axis=1)
     nyquist_hz = 0.5 / sample_period
-    return frequencies, magnitudes, nyquist_hz, sample_count
+    return frequencies, psd, nyquist_hz, sample_count
 
 
 class FastImuAxisPoller:
@@ -2165,13 +2216,13 @@ def run_fast_imu_grid_plot(
     gyro_lines = add_lines(ax_gyro, ("Gyro X", "Gyro Y", "Gyro Z"), 1.5)
     rpy_lines = add_lines(ax_rpy, ("Roll", "Pitch", "Yaw"), 1.5)
 
-    ax_acc_freq = make_plot(1, 1, "Accel Data Frequency Analysis", "Magnitude")
-    ax_gyro_freq = make_plot(2, 1, "Gyro Data Frequency Analysis", "Magnitude")
+    ax_acc_freq = make_plot(1, 1, "Accel Data PSD", "PSD (g^2/Hz)")
+    ax_gyro_freq = make_plot(2, 1, "Gyro Data PSD", "PSD ((deg/s)^2/Hz)")
     ax_rpy_freq = make_plot(
         3,
         1,
-        "RPY Data Frequency Analysis",
-        "Magnitude",
+        "RPY Data PSD",
+        "PSD (deg^2/Hz)",
         x_label="Frequency (Hz)",
     )
     acc_freq_lines = add_lines(ax_acc_freq, ("Acc X", "Acc Y", "Acc Z"), 1.2)
@@ -2185,7 +2236,7 @@ def run_fast_imu_grid_plot(
     refresh_timestamps: deque[float] = deque(maxlen=120)
     dropped_pending = 0
     latest_nyquist_hz: float | None = None
-    latest_fft_samples = 0
+    latest_psd_samples = 0
 
     def decimation_indexes(sample_count: int) -> npt.NDArray[np.intp] | None:
         if sample_count <= max_points:
@@ -2253,19 +2304,19 @@ def run_fast_imu_grid_plot(
     def update_frequency_axis(
         axis: Any,
         lines: tuple[Any, Any, Any],
-        magnitudes: npt.NDArray[np.float64],
+        psd_values: npt.NDArray[np.float64],
         channel_indexes: tuple[int, int, int],
         frequencies: npt.NDArray[np.float64],
         axis_range: FrequencyAxisRange,
     ) -> None:
-        max_magnitude = 0.0
+        max_density = 0.0
         for line, channel_index in zip(lines, channel_indexes):
-            channel_magnitudes = magnitudes[channel_index]
-            if channel_magnitudes.size > 0:
-                max_magnitude = max(max_magnitude, float(np_module.max(channel_magnitudes)))
+            channel_psd = psd_values[channel_index]
+            if channel_psd.size > 0:
+                max_density = max(max_density, float(np_module.max(channel_psd)))
             line.setData(
                 x=frequencies,
-                y=channel_magnitudes,
+                y=channel_psd,
                 connect="all",
                 skipFiniteCheck=True,
             )
@@ -2275,7 +2326,7 @@ def run_fast_imu_grid_plot(
             axis.setXRange(0.0, next_x_max, padding=0.0)
             axis_range.x_max = next_x_max
 
-        next_y_max = max(max_magnitude * 1.1, 1e-9)
+        next_y_max = max(max_density * 1.1, 1e-12)
         if (
             axis_range.y_max == 0.0
             or next_y_max > axis_range.y_max
@@ -2285,25 +2336,25 @@ def run_fast_imu_grid_plot(
             axis_range.y_max = next_y_max
 
     def refresh_spectrum() -> None:
-        nonlocal latest_nyquist_hz, latest_fft_samples
+        nonlocal latest_nyquist_hz, latest_psd_samples
 
-        spectrum = imu_frequency_spectrum(
+        spectrum = imu_frequency_psd(
             plot_history.valid_timestamps(),
             plot_history.valid_values(),
             window_s=fft_window,
         )
         if spectrum is None:
             latest_nyquist_hz = None
-            latest_fft_samples = 0
+            latest_psd_samples = 0
             return
 
-        frequencies, magnitudes, nyquist_hz, sample_count = spectrum
+        frequencies, psd_values, nyquist_hz, sample_count = spectrum
         latest_nyquist_hz = nyquist_hz
-        latest_fft_samples = sample_count
+        latest_psd_samples = sample_count
         update_frequency_axis(
             ax_acc_freq,
             acc_freq_lines,
-            magnitudes,
+            psd_values,
             (ACC_X_INDEX, ACC_Y_INDEX, ACC_Z_INDEX),
             frequencies,
             acc_freq_range,
@@ -2311,7 +2362,7 @@ def run_fast_imu_grid_plot(
         update_frequency_axis(
             ax_gyro_freq,
             gyro_freq_lines,
-            magnitudes,
+            psd_values,
             (GYRO_X_INDEX, GYRO_Y_INDEX, GYRO_Z_INDEX),
             frequencies,
             gyro_freq_range,
@@ -2319,7 +2370,7 @@ def run_fast_imu_grid_plot(
         update_frequency_axis(
             ax_rpy_freq,
             rpy_freq_lines,
-            magnitudes,
+            psd_values,
             (ROLL_INDEX, PITCH_INDEX, YAW_INDEX),
             frequencies,
             rpy_freq_range,
@@ -2331,10 +2382,10 @@ def run_fast_imu_grid_plot(
         sample_text = "measuring" if sample_hz is None else f"{sample_hz:.1f} Hz"
         plot_hz = actual_plot_hz()
         plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
-        fft_text = (
-            "FFT: measuring"
+        psd_text = (
+            "PSD: measuring"
             if latest_nyquist_hz is None
-            else f"FFT: {latest_fft_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
+            else f"PSD: {latest_psd_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
         )
         error_text = (
             f" | error: {snapshot.last_error}"
@@ -2345,7 +2396,7 @@ def run_fast_imu_grid_plot(
         status.setText(
             f"{state} | samples: {snapshot.samples} | "
             f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
-            f"plot: {plot_text} | {fft_text} | timeouts: {snapshot.timeouts} | "
+            f"plot: {plot_text} | {psd_text} | timeouts: {snapshot.timeouts} | "
             f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
             f"dropped_ui: {dropped_pending}{error_text}"
         )
@@ -2354,9 +2405,9 @@ def run_fast_imu_grid_plot(
     plot_timer.setInterval(round(1000.0 / plot_rate))
     plot_timer.timeout.connect(refresh_plot)
 
-    fft_timer = QtCore.QTimer()
-    fft_timer.setInterval(round(1000.0 / fft_rate))
-    fft_timer.timeout.connect(refresh_spectrum)
+    psd_timer = QtCore.QTimer()
+    psd_timer.setInterval(round(1000.0 / fft_rate))
+    psd_timer.timeout.connect(refresh_spectrum)
 
     status_timer = QtCore.QTimer()
     status_timer.setInterval(round(1000.0 / DEFAULT_STATUS_INTERVAL))
@@ -2364,7 +2415,7 @@ def run_fast_imu_grid_plot(
 
     def stop_updates(*_args: object) -> None:
         plot_timer.stop()
-        fft_timer.stop()
+        psd_timer.stop()
         status_timer.stop()
 
     window.destroyed.connect(stop_updates)
@@ -2374,7 +2425,7 @@ def run_fast_imu_grid_plot(
     window.show()
     poller.start()
     plot_timer.start()
-    fft_timer.start()
+    psd_timer.start()
     status_timer.start()
 
     exec_app = getattr(app, "exec", None)
@@ -2467,15 +2518,15 @@ def run_accel_axis_plot(
 
     spectrum_plot = spectrum_widget.getPlotItem()
     spectrum_plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
-    spectrum_plot.setLabel("left", "magnitude", units="g")
+    spectrum_plot.setLabel("left", "PSD", units="g^2/Hz")
     spectrum_plot.setLabel("bottom", "frequency", units="Hz")
     spectrum_plot.setXRange(0.0, 1.0, padding=0.0)
-    spectrum_plot.setYRange(0.0, 1e-6, padding=0.0)
+    spectrum_plot.setYRange(0.0, 1e-12, padding=0.0)
     spectrum_line = pg.PlotCurveItem(
         np_module.empty(0, dtype=np_module.float64),
         np_module.empty(0, dtype=np_module.float64),
         pen=pg.mkPen(selected_theme.line_color, width=1.2),
-        name=f"{axis_name} FFT",
+        name=f"{axis_name} PSD",
         connect="all",
         skipFiniteCheck=True,
     )
@@ -2486,7 +2537,7 @@ def run_accel_axis_plot(
     refresh_timestamps: deque[float] = deque(maxlen=120)
     dropped_pending = 0
     latest_nyquist_hz: float | None = None
-    latest_fft_samples = 0
+    latest_psd_samples = 0
 
     def actual_plot_hz() -> float | None:
         if len(refresh_timestamps) < 2:
@@ -2530,32 +2581,32 @@ def run_accel_axis_plot(
             plot.setXRange(float(x_values[0]), float(x_values[-1]), padding=0.0)
 
     def refresh_spectrum() -> None:
-        nonlocal latest_nyquist_hz, latest_fft_samples
+        nonlocal latest_nyquist_hz, latest_psd_samples
 
-        spectrum = axis_frequency_spectrum(
+        spectrum = axis_frequency_psd(
             plot_history.valid_timestamps(),
             plot_history.valid_values(),
             window_s=fft_window,
         )
         if spectrum is None:
             latest_nyquist_hz = None
-            latest_fft_samples = 0
+            latest_psd_samples = 0
             return
 
-        frequencies, magnitudes, nyquist_hz, sample_count = spectrum
+        frequencies, psd_values, nyquist_hz, sample_count = spectrum
         latest_nyquist_hz = nyquist_hz
-        latest_fft_samples = sample_count
+        latest_psd_samples = sample_count
         spectrum_line.setData(
             x=frequencies,
-            y=magnitudes,
+            y=psd_values,
             connect="all",
             skipFiniteCheck=True,
         )
 
         if frequencies.size > 0:
             spectrum_plot.setXRange(0.0, float(frequencies[-1]), padding=0.0)
-        max_magnitude = float(np_module.max(magnitudes)) if magnitudes.size else 0.0
-        spectrum_plot.setYRange(0.0, max(max_magnitude * 1.1, 1e-9), padding=0.0)
+        max_density = float(np_module.max(psd_values)) if psd_values.size else 0.0
+        spectrum_plot.setYRange(0.0, max(max_density * 1.1, 1e-12), padding=0.0)
 
     def refresh_status() -> None:
         snapshot = poller.snapshot()
@@ -2568,10 +2619,10 @@ def run_accel_axis_plot(
         sample_text = "measuring" if sample_hz is None else f"{sample_hz:.1f} Hz"
         plot_hz = actual_plot_hz()
         plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
-        fft_text = (
-            "FFT: measuring"
+        psd_text = (
+            "PSD: measuring"
             if latest_nyquist_hz is None
-            else f"FFT: {latest_fft_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
+            else f"PSD: {latest_psd_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
         )
         error_text = (
             f" | error: {snapshot.last_error}"
@@ -2582,7 +2633,7 @@ def run_accel_axis_plot(
         status.setText(
             f"{state} | latest: {latest} | samples: {snapshot.samples} | "
             f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
-            f"plot: {plot_text} | {fft_text} | timeouts: {snapshot.timeouts} | "
+            f"plot: {plot_text} | {psd_text} | timeouts: {snapshot.timeouts} | "
             f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
             f"dropped_ui: {dropped_pending}{error_text}"
         )
@@ -2591,9 +2642,9 @@ def run_accel_axis_plot(
     plot_timer.setInterval(round(1000.0 / plot_rate))
     plot_timer.timeout.connect(refresh_plot)
 
-    fft_timer = QtCore.QTimer()
-    fft_timer.setInterval(round(1000.0 / fft_rate))
-    fft_timer.timeout.connect(refresh_spectrum)
+    psd_timer = QtCore.QTimer()
+    psd_timer.setInterval(round(1000.0 / fft_rate))
+    psd_timer.timeout.connect(refresh_spectrum)
 
     status_timer = QtCore.QTimer()
     status_timer.setInterval(round(1000.0 / DEFAULT_STATUS_INTERVAL))
@@ -2601,7 +2652,7 @@ def run_accel_axis_plot(
 
     def stop_updates(*_args: object) -> None:
         plot_timer.stop()
-        fft_timer.stop()
+        psd_timer.stop()
         status_timer.stop()
 
     window.destroyed.connect(stop_updates)
@@ -2611,7 +2662,7 @@ def run_accel_axis_plot(
     window.show()
     poller.start()
     plot_timer.start()
-    fft_timer.start()
+    psd_timer.start()
     status_timer.start()
 
     exec_app = getattr(app, "exec", None)
@@ -2865,7 +2916,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot",
         action="store_true",
         help=(
-            "Open a PyQtGraph 2x3 UI with accel, gyro, and RPY time/frequency plots. "
+            "Open a PyQtGraph 2x3 UI with accel, gyro, and RPY time/PSD plots. "
             "If --mask/--fields is omitted, RPY + accelerometer + gyroscope are requested."
         ),
     )
@@ -2905,14 +2956,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_FFT_WINDOW,
         metavar="SEC",
-        help=f"Seconds of raw samples to keep in the FFT window (default: {DEFAULT_FFT_WINDOW:g}).",
+        help=(
+            "Seconds of raw samples in each PSD analysis window "
+            f"(default: {DEFAULT_FFT_WINDOW:g})."
+        ),
     )
     parser.add_argument(
         "--fft-rate",
         type=float,
         default=DEFAULT_FFT_RATE,
         metavar="HZ",
-        help=f"Frequency plot redraw rate in Hz (default: {DEFAULT_FFT_RATE:g}).",
+        help=f"PSD plot redraw rate in Hz (default: {DEFAULT_FFT_RATE:g}).",
     )
     parser.add_argument(
         "--plot-pending",
