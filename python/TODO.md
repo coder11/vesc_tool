@@ -1,6 +1,5 @@
 # TODO: Decouple Fast IMU Acquisition From Plotting
 
-## Problem
 
 `python/examples/poll_imu_fast.py` can poll IMU data faster in text mode than in
 GUI mode. A representative comparison is roughly:
