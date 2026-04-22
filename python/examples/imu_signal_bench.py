@@ -14,6 +14,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
@@ -88,6 +89,16 @@ PLOT_THEMES = {
         line_colors=((230, 88, 85), (80, 190, 120), (85, 150, 245)),
     ),
 }
+
+
+@dataclass(frozen=True)
+class SignalStats:
+    """Summary metrics for the retained signal window."""
+
+    mean: float
+    std: float
+    rms: float
+    peak_to_peak: float
 
 
 def parse_axis_arg(text: str) -> str:
@@ -181,6 +192,33 @@ def format_value(value: float | None, unit: str) -> str:
     return "n/a" if value is None else f"{value:.6g} {unit}"
 
 
+def signal_stats(values: npt.NDArray[np.float64]) -> SignalStats | None:
+    """Return summary metrics for the supplied signal values."""
+    if values.size == 0:
+        return None
+    return SignalStats(
+        mean=float(np.mean(values)),
+        std=float(np.std(values)),
+        rms=float(np.sqrt(np.mean(values * values))),
+        peak_to_peak=float(np.ptp(values)),
+    )
+
+
+def format_stats(stats: SignalStats | None, unit: str) -> str:
+    """Format optional signal metrics for status text."""
+    if stats is None:
+        return (
+            "mean: n/a | std: n/a | RMS: n/a | "
+            "peak-to-peak: n/a"
+        )
+    return (
+        f"mean: {stats.mean:.6g} {unit} | "
+        f"std: {stats.std:.6g} {unit} | "
+        f"RMS: {stats.rms:.6g} {unit} | "
+        f"peak-to-peak: {stats.peak_to_peak:.6g} {unit}"
+    )
+
+
 def run_signal_bench(
     source: SignalSource,
     *,
@@ -257,6 +295,7 @@ def run_signal_bench(
 
     status = QtWidgets.QLabel("Waiting for signal data...")
     status.setAlignment(qt_alignment.AlignLeft)
+    status.setWordWrap(True)
     status.setStyleSheet(f"color: {selected_theme.muted_color};")
     root.addWidget(status)
 
@@ -327,6 +366,7 @@ def run_signal_bench(
     latest_raw: float | None = None
     latest_filtered: float | None = None
     latest_residual: float | None = None
+    latest_stats: SignalStats | None = None
 
     def selected_mode() -> str:
         for mode_name, button in mode_buttons.items():
@@ -335,11 +375,12 @@ def run_signal_bench(
         return "both"
 
     def clear_history() -> None:
-        nonlocal latest_raw, latest_filtered, latest_residual
+        nonlocal latest_raw, latest_filtered, latest_residual, latest_stats
         signal_history.clear()
         latest_raw = None
         latest_filtered = None
         latest_residual = None
+        latest_stats = None
         for line in (raw_line, filtered_line, residual_line):
             line.setData(x=empty, y=empty, connect="all", skipFiniteCheck=True)
 
@@ -351,7 +392,7 @@ def run_signal_bench(
         legend.setVisible(mode_name == "both")
 
     def refresh_plot() -> None:
-        nonlocal dropped_pending, latest_raw, latest_filtered, latest_residual
+        nonlocal dropped_pending, latest_raw, latest_filtered, latest_residual, latest_stats
 
         timestamps, values, dropped = source.drain()
         dropped_pending += dropped
@@ -370,6 +411,7 @@ def run_signal_bench(
         latest_raw = float(raw_values[-1])
         latest_filtered = float(filtered_values[-1])
         latest_residual = float(residual_values[-1])
+        latest_stats = signal_stats(raw_values)
 
         indexes = decimate_indexes(int(x_values.size), max_points)
         if indexes is not None:
@@ -418,6 +460,7 @@ def run_signal_bench(
             f"{state} | raw: {format_value(latest_raw, source.unit)} | "
             f"filtered: {format_value(latest_filtered, source.unit)} | "
             f"residual: {format_value(latest_residual, source.unit)} | "
+            f"{format_stats(latest_stats, source.unit)} | "
             f"sma: {int(sma_spin.value())} | samples: {snapshot.samples} | "
             f"source avg: {snapshot.average_rate_hz:.1f} Hz | "
             f"history: {format_rate(history_hz)} | plot: {format_rate(plot_hz)} | "
