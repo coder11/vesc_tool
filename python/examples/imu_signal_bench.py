@@ -9,6 +9,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -44,6 +45,7 @@ DEFAULT_MAX_POINTS = 1200
 DEFAULT_PLOT_RATE = 30.0
 DEFAULT_PENDING_SAMPLES = 20000
 DEFAULT_DETERMINISTIC_RATE = 500.0
+QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
 
 
 class PlotTheme:
@@ -109,14 +111,19 @@ def parse_axis_arg(text: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def import_pyqtgraph() -> tuple[Any, Any, Any]:
-    """Import PyQtGraph lazily so --help does not require Qt startup."""
+def prefer_qt_xcb_platform() -> None:
+    """Prefer Qt's XCB backend when Linux exposes a Wayland/X11 fallback chain."""
     if (
         sys.platform.startswith("linux")
-        and "QT_QPA_PLATFORM" not in os.environ
         and "DISPLAY" in os.environ
+        and os.environ.get("QT_QPA_PLATFORM") in (None, "", "wayland;xcb")
     ):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+
+def import_pyqtgraph() -> tuple[Any, Any, Any]:
+    """Import PyQtGraph lazily so --help does not require Qt startup."""
+    prefer_qt_xcb_platform()
 
     try:
         import pyqtgraph as pg  # type: ignore[import-untyped]
@@ -129,6 +136,29 @@ def import_pyqtgraph() -> tuple[Any, Any, Any]:
         ) from exc
 
     return pg, QtCore, QtWidgets
+
+
+def require_qt_platform_runtime() -> None:
+    """Fail before QApplication aborts when XCB runtime libraries are missing."""
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("QT_QPA_PLATFORM") != "xcb":
+        return
+
+    missing: list[str] = []
+    for lib_name in QT_XCB_RUNTIME_LIBS:
+        try:
+            ctypes.CDLL(lib_name)
+        except OSError:
+            missing.append(lib_name)
+
+    if missing:
+        raise RuntimeError(
+            "Qt's xcb platform plugin is missing runtime libraries: "
+            f"{', '.join(missing)}. Run this from the python Nix dev shell "
+            "(`nix develop .#python`), or install the matching system packages "
+            "(for example libxcb-cursor0 and libxcb-icccm4 on Debian/Ubuntu)."
+        )
 
 
 def autodetect_port() -> str:
@@ -233,6 +263,7 @@ def run_signal_bench(
     """Run the PyQtGraph live signal bench."""
     selected_theme = PLOT_THEMES[theme]
     pg, QtCore, QtWidgets = import_pyqtgraph()
+    require_qt_platform_runtime()
     pg.setConfigOptions(
         antialias=antialias,
         background=selected_theme.pg_background,

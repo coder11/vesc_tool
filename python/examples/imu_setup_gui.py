@@ -297,15 +297,19 @@ def tcp_server_help(endpoint: str, port: int) -> str:
     )
 
 
-def import_pyside6() -> tuple[Any, Any]:
-    """Import PySide6 lazily so --scan-udp does not require Qt."""
-
+def prefer_qt_xcb_platform() -> None:
+    """Prefer Qt's XCB backend when Linux exposes a Wayland/X11 fallback chain."""
     if (
         sys.platform.startswith("linux")
-        and "QT_QPA_PLATFORM" not in os.environ
         and "DISPLAY" in os.environ
+        and os.environ.get("QT_QPA_PLATFORM") in (None, "", "wayland;xcb")
     ):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+
+def import_pyside6() -> tuple[Any, Any]:
+    """Import PySide6 lazily so --scan-udp does not require Qt."""
+    prefer_qt_xcb_platform()
 
     try:
         from PySide6 import QtCore, QtWidgets

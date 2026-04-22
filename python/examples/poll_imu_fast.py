@@ -1776,14 +1776,19 @@ class FastImuPlotPoller:
             self._done.set()
 
 
-def import_pyqtgraph() -> tuple[Any, Any, Any]:
-    """Import PyQtGraph lazily so non-plot commands do not require Qt."""
+def prefer_qt_xcb_platform() -> None:
+    """Prefer Qt's XCB backend when Linux exposes a Wayland/X11 fallback chain."""
     if (
         sys.platform.startswith("linux")
-        and "QT_QPA_PLATFORM" not in os.environ
         and "DISPLAY" in os.environ
+        and os.environ.get("QT_QPA_PLATFORM") in (None, "", "wayland;xcb")
     ):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+
+def import_pyqtgraph() -> tuple[Any, Any, Any]:
+    """Import PyQtGraph lazily so non-plot commands do not require Qt."""
+    prefer_qt_xcb_platform()
 
     try:
         import pyqtgraph as pg  # type: ignore[import-untyped]

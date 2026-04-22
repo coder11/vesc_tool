@@ -1,7 +1,9 @@
+import os
+
 import numpy as np
 import pytest
 
-from examples.imu_signal_bench import format_stats, signal_stats
+from examples.imu_signal_bench import format_stats, prefer_qt_xcb_platform, signal_stats
 
 
 def test_signal_stats_returns_window_metrics() -> None:
@@ -22,3 +24,27 @@ def test_signal_stats_handles_empty_values() -> None:
         format_stats(stats, "g")
         == "mean: n/a | std: n/a | RMS: n/a | peak-to-peak: n/a"
     )
+
+
+def test_prefer_qt_xcb_platform_replaces_wayland_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "wayland;xcb")
+
+    prefer_qt_xcb_platform()
+
+    assert os.environ["QT_QPA_PLATFORM"] == "xcb"
+
+
+def test_prefer_qt_xcb_platform_preserves_explicit_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "wayland")
+
+    prefer_qt_xcb_platform()
+
+    assert os.environ["QT_QPA_PLATFORM"] == "wayland"
