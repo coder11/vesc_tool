@@ -7,13 +7,18 @@ import pytest
 from examples.poll_imu_fast import (
     AxisPlotHistory,
     AxisSampleBuffer,
+    HOST_RX_TIMING_NOTICE,
+    HOST_RX_TIMESTAMP_SOURCE,
     IMU_PLOT_CHANNELS,
     ImuPlotHistory,
     ImuSampleBuffer,
+    ParsedImu,
     axis_frequency_spectrum,
     field_value_index,
     imu_frequency_spectrum,
     parse_accel_axis_arg,
+    write_csv_header,
+    write_sample,
 )
 
 
@@ -32,6 +37,41 @@ def test_parse_accel_axis_accepts_short_and_field_names() -> None:
 
     with pytest.raises(argparse.ArgumentTypeError):
         parse_accel_axis_arg("roll")
+
+
+def test_csv_header_labels_host_receive_timing(capsys: pytest.CaptureFixture[str]) -> None:
+    write_csv_header(0x0038)
+
+    assert capsys.readouterr().out == (
+        "host_rx_time_s,host_rx_dt_s,vesc_id,rx_mask,acc_x,acc_y,acc_z\n"
+    )
+
+
+def test_human_sample_output_labels_host_receive_timing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parsed = ParsedImu(mask=0x0001, values=(1.25,), vesc_id=None)
+
+    write_sample(
+        2,
+        timestamp_ns=1_250_000_000,
+        start_ns=1_000_000_000,
+        previous_ns=1_200_000_000,
+        parsed=parsed,
+        csv=False,
+    )
+
+    output = capsys.readouterr().out
+    assert "host_rx_t=0.250000s" in output
+    assert "host_rx_dt=0.050000000" in output
+    assert "sample=2 t=" not in output
+
+
+def test_timestamp_source_documents_receive_completion() -> None:
+    assert HOST_RX_TIMESTAMP_SOURCE == "host_rx_after_packet"
+    assert "configured IMU sample rate" in HOST_RX_TIMING_NOTICE
+    assert "latest cached values" in HOST_RX_TIMING_NOTICE
+    assert "sample timestamps or sample indexes" in HOST_RX_TIMING_NOTICE
 
 
 def test_axis_sample_buffer_drains_in_order_after_overwrite() -> None:

@@ -6,6 +6,14 @@ handshake, uses generic packet dispatch, and returns Pydantic models. This
 script keeps the hot path small: one pre-encoded COMM_GET_IMU_DATA request,
 direct serial reads, CRC validation, and lightweight value decoding.
 
+Timing note: the firmware IMU drivers run at the configured IMU sample rate and
+update cached IMU state, but COMM_GET_IMU_DATA does not carry a sample timestamp
+or sequence number. All timestamps in this example are host monotonic
+receive-completion timestamps taken after a full response packet has been read.
+dt, plot rates, and PSD frequency bins therefore describe host-observed packet
+timing; do not treat them as direct IMU sampling jitter or use them for precise
+phase estimates without firmware-side sample timestamps or sample indexes.
+
 Examples:
     python examples/poll_imu_fast.py
     python examples/poll_imu_fast.py --port /dev/ttyACM0 --duration 10
@@ -64,6 +72,14 @@ PLOT_SAMPLE_BATCH = 64
 PLOT_SAMPLE_BATCH_NS = 5_000_000
 DEFAULT_PIPELINE_DEPTH = 1
 NSEC_PER_SEC = 1_000_000_000
+HOST_RX_TIMESTAMP_SOURCE = "host_rx_after_packet"
+HOST_RX_TIMING_NOTICE = (
+    "Firmware samples IMU data at the configured IMU sample rate, but "
+    "COMM_GET_IMU_DATA returns only the latest cached values. This tool timestamps "
+    "host packet receive completion, so dt, plot rates, and PSD timing describe "
+    "host-observed packet timing. Use firmware-side sample timestamps or sample "
+    "indexes for sampling-jitter or phase analysis."
+)
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
 ROLL_INDEX = 0
 PITCH_INDEX = 1
@@ -316,7 +332,8 @@ class TerminalImuDisplay:
                 f"discarded: {reader_stats.discarded_bytes}   unexpected: "
                 f"{reader_stats.unexpected_packets}"
             ),
-            f"vesc_id: {vesc_id}   rx_mask: 0x{parsed.mask:04x}   sample_age: {age_ms:.2f} ms",
+            f"timing: {HOST_RX_TIMESTAMP_SOURCE}   sample_age: {age_ms:.2f} ms",
+            f"vesc_id: {vesc_id}   rx_mask: 0x{parsed.mask:04x}",
             "",
             "IMU values",
         ]
@@ -706,7 +723,7 @@ def format_values(mask: int, values: tuple[float, ...], max_fields: int = 9) -> 
 def write_csv_header(mask: int) -> None:
     """Write the CSV header for the requested field mask."""
     fields = ",".join(field_names_for_mask(mask))
-    print(f"time_s,dt_s,vesc_id,rx_mask,{fields}")
+    print(f"host_rx_time_s,host_rx_dt_s,vesc_id,rx_mask,{fields}")
 
 
 def write_sample(
@@ -719,20 +736,21 @@ def write_sample(
     csv: bool,
 ) -> None:
     """Write one sample in CSV or human-readable form."""
-    elapsed = (timestamp_ns - start_ns) / NSEC_PER_SEC
+    host_rx_elapsed = (timestamp_ns - start_ns) / NSEC_PER_SEC
     dt = "" if previous_ns is None else f"{(timestamp_ns - previous_ns) / NSEC_PER_SEC:.9f}"
     vesc_id = "" if parsed.vesc_id is None else str(parsed.vesc_id)
 
     if csv:
         values = ",".join(f"{value:.9g}" for value in parsed.values)
         sys.stdout.write(
-            f"{elapsed:.9f},{dt},{vesc_id},0x{parsed.mask:04x},{values}\n"
+            f"{host_rx_elapsed:.9f},{dt},{vesc_id},0x{parsed.mask:04x},{values}\n"
         )
         return
 
     value_text = format_values(parsed.mask, parsed.values, max_fields=len(parsed.values))
     sys.stdout.write(
-        f"sample={sample_index} t={elapsed:.6f}s dt={dt or 'n/a'} "
+        f"sample={sample_index} host_rx_t={host_rx_elapsed:.6f}s "
+        f"host_rx_dt={dt or 'n/a'} "
         f"id={vesc_id or 'n/a'} mask=0x{parsed.mask:04x} {value_text}\n"
     )
 
@@ -1260,7 +1278,7 @@ def axis_frequency_psd(
     *,
     window_s: float,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
-    """Return Welch PSD frequency bins, densities, Nyquist Hz, and sample count."""
+    """Return Welch PSD bins using the supplied host receive timestamps."""
     if timestamps.size < 2:
         return None
 
@@ -1293,7 +1311,7 @@ def imu_frequency_psd(
     *,
     window_s: float,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
-    """Return Welch PSD bins and channel densities for the recent IMU window."""
+    """Return Welch PSD bins using the supplied host receive timestamps."""
     if timestamps.size < 2:
         return None
 
@@ -1318,6 +1336,88 @@ def imu_frequency_psd(
     frequencies, psd = _welch_psd(window_values, sample_period=sample_period, axis=1)
     nyquist_hz = 0.5 / sample_period
     return frequencies, psd, nyquist_hz, sample_count
+
+
+def axis_frequency_spectrum(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+    *,
+    window_s: float,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
+    """Return full-window FFT magnitudes using host receive timestamps."""
+    if timestamps.size < 2:
+        return None
+
+    np_module = import_numpy()
+    window_start_s = float(timestamps[-1]) - window_s
+    start_index = int(np_module.searchsorted(timestamps, window_start_s, side="left"))
+    window_timestamps = timestamps[start_index:]
+    window_values = values[start_index:]
+    sample_count = int(window_timestamps.size)
+    if sample_count < 2:
+        return None
+
+    sample_periods = np_module.diff(window_timestamps)
+    sample_periods = sample_periods[sample_periods > 0.0]
+    if sample_periods.size == 0:
+        return None
+
+    sample_period = float(np_module.median(sample_periods))
+    if not math.isfinite(sample_period) or sample_period <= 0.0:
+        return None
+
+    centered_values = window_values - float(np_module.mean(window_values))
+    magnitudes = cast(
+        "npt.NDArray[np.float64]",
+        np_module.abs(np_module.fft.rfft(centered_values)) / sample_count,
+    )
+    frequencies = cast(
+        "npt.NDArray[np.float64]",
+        np_module.fft.rfftfreq(sample_count, d=sample_period),
+    )
+    nyquist_hz = 0.5 / sample_period
+    return frequencies, magnitudes, nyquist_hz, sample_count
+
+
+def imu_frequency_spectrum(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+    *,
+    window_s: float,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, int] | None:
+    """Return full-window FFT magnitudes using host receive timestamps."""
+    if timestamps.size < 2:
+        return None
+
+    np_module = import_numpy()
+    window_start_s = float(timestamps[-1]) - window_s
+    start_index = int(np_module.searchsorted(timestamps, window_start_s, side="left"))
+    window_timestamps = timestamps[start_index:]
+    window_values = values[:, start_index:]
+    sample_count = int(window_timestamps.size)
+    if sample_count < 2:
+        return None
+
+    sample_periods = np_module.diff(window_timestamps)
+    sample_periods = sample_periods[sample_periods > 0.0]
+    if sample_periods.size == 0:
+        return None
+
+    sample_period = float(np_module.median(sample_periods))
+    if not math.isfinite(sample_period) or sample_period <= 0.0:
+        return None
+
+    centered_values = window_values - np_module.mean(window_values, axis=1, keepdims=True)
+    magnitudes = cast(
+        "npt.NDArray[np.float64]",
+        np_module.abs(np_module.fft.rfft(centered_values, axis=1)) / sample_count,
+    )
+    frequencies = cast(
+        "npt.NDArray[np.float64]",
+        np_module.fft.rfftfreq(sample_count, d=sample_period),
+    )
+    nyquist_hz = 0.5 / sample_period
+    return frequencies, magnitudes, nyquist_hz, sample_count
 
 
 class FastImuAxisPoller:
@@ -1454,6 +1554,8 @@ class FastImuAxisPoller:
                         self._packet_timeout,
                         self._reader_stats,
                     )
+                    # This is a host receive-completion timestamp, not an IMU
+                    # acquisition timestamp.
                     now_ns = time.perf_counter_ns()
                     if payload is None:
                         self._poll_stats.timeouts += 1
@@ -1642,6 +1744,8 @@ class FastImuPlotPoller:
                         self._packet_timeout,
                         self._reader_stats,
                     )
+                    # This is a host receive-completion timestamp, not an IMU
+                    # acquisition timestamp.
                     now_ns = time.perf_counter_ns()
                     if payload is None:
                         self._poll_stats.timeouts += 1
@@ -2211,7 +2315,14 @@ def run_fast_imu_grid_plot(
 
     ax_acc = make_plot(1, 0, "Accel Data", "g", y_range=(-8, 8))
     ax_gyro = make_plot(2, 0, "Gyro Data", "Gyro", y_range=(-2000, 2000))
-    ax_rpy = make_plot(3, 0, "RPY Data", "Degrees", x_label="Time (s)", y_range=(-200, 200))
+    ax_rpy = make_plot(
+        3,
+        0,
+        "RPY Data",
+        "Degrees",
+        x_label="Host RX time (s)",
+        y_range=(-200, 200),
+    )
     acc_lines = add_lines(ax_acc, ("Acc X", "Acc Y", "Acc Z"), 1.5)
     gyro_lines = add_lines(ax_gyro, ("Gyro X", "Gyro Y", "Gyro Z"), 1.5)
     rpy_lines = add_lines(ax_rpy, ("Roll", "Pitch", "Yaw"), 1.5)
@@ -2383,9 +2494,12 @@ def run_fast_imu_grid_plot(
         plot_hz = actual_plot_hz()
         plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
         psd_text = (
-            "PSD: measuring"
+            "host-timed PSD: measuring"
             if latest_nyquist_hz is None
-            else f"PSD: {latest_psd_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
+            else (
+                f"host-timed PSD: {latest_psd_samples} samples/{fft_window:g}s, "
+                f"Nyquist {latest_nyquist_hz:.1f} Hz"
+            )
         )
         error_text = (
             f" | error: {snapshot.last_error}"
@@ -2395,7 +2509,8 @@ def run_fast_imu_grid_plot(
         state = "stopped" if snapshot.done else "running"
         status.setText(
             f"{state} | samples: {snapshot.samples} | "
-            f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
+            f"poll avg: {snapshot.average_rate_hz:.1f} Hz | "
+            f"host-dt window: {sample_text} | "
             f"plot: {plot_text} | {psd_text} | timeouts: {snapshot.timeouts} | "
             f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
             f"dropped_ui: {dropped_pending}{error_text}"
@@ -2494,7 +2609,7 @@ def run_accel_axis_plot(
     plot = plot_widget.getPlotItem()
     plot.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
     plot.setLabel("left", axis_name, units="g")
-    plot.setLabel("bottom", "time", units="s")
+    plot.setLabel("bottom", "host RX time", units="s")
     plot.setYRange(-8.0, 8.0, padding=0.0)
     plot.enableAutoRange(axis="y", enable=False)
     for method_name, args in (
@@ -2620,9 +2735,12 @@ def run_accel_axis_plot(
         plot_hz = actual_plot_hz()
         plot_text = "measuring" if plot_hz is None else f"{plot_hz:.1f} Hz"
         psd_text = (
-            "PSD: measuring"
+            "host-timed PSD: measuring"
             if latest_nyquist_hz is None
-            else f"PSD: {latest_psd_samples} samples/{fft_window:g}s, Nyquist {latest_nyquist_hz:.1f} Hz"
+            else (
+                f"host-timed PSD: {latest_psd_samples} samples/{fft_window:g}s, "
+                f"Nyquist {latest_nyquist_hz:.1f} Hz"
+            )
         )
         error_text = (
             f" | error: {snapshot.last_error}"
@@ -2632,7 +2750,8 @@ def run_accel_axis_plot(
         state = "stopped" if snapshot.done else "running"
         status.setText(
             f"{state} | latest: {latest} | samples: {snapshot.samples} | "
-            f"poll avg: {snapshot.average_rate_hz:.1f} Hz | window: {sample_text} | "
+            f"poll avg: {snapshot.average_rate_hz:.1f} Hz | "
+            f"host-dt window: {sample_text} | "
             f"plot: {plot_text} | {psd_text} | timeouts: {snapshot.timeouts} | "
             f"parse: {snapshot.parse_errors} | bad_crc: {snapshot.bad_crc} | "
             f"dropped_ui: {dropped_pending}{error_text}"
@@ -2722,6 +2841,8 @@ def poll_imu(
                 packet_timeout,
                 reader_stats,
             )
+            # This is a host receive-completion timestamp, not an IMU
+            # acquisition timestamp.
             now_ns = time.perf_counter_ns()
             if payload is None:
                 poll_stats.timeouts += 1
@@ -3131,6 +3252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"display={'plot' if args.plot else 'tui' if tui is not None else 'plain'}",
         file=sys.stderr,
     )
+    print(HOST_RX_TIMING_NOTICE, file=sys.stderr)
     serial_port = open_serial(
         port,
         args.baudrate,
