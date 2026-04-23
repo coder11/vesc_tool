@@ -3,6 +3,7 @@
 
 Examples:
     python examples/imu_signal_bench.py --source deterministic --axis acc_z --filter sma
+    python examples/imu_signal_bench.py --source deterministic-white-noise --axis acc_z
     python examples/imu_signal_bench.py --source vesc --axis acc_z --pipeline-depth 4
 """
 
@@ -33,6 +34,7 @@ from vesc_py.fast_imu_source import (
     parse_imu_axis,
 )
 from vesc_py.live_signal import (
+    DeterministicWhiteNoiseSignalSource,
     DeterministicSignalSource,
     NoisyDeterministicSignalSource,
     SignalRingHistory,
@@ -1153,7 +1155,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=("vesc", "deterministic", "deterministic-noisy"),
+        choices=(
+            "vesc",
+            "deterministic",
+            "deterministic-noisy",
+            "deterministic-white-noise",
+        ),
         default="vesc",
         help="Signal source to use (default: vesc).",
     )
@@ -1289,7 +1296,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DETERMINISTIC_RATE,
         metavar="HZ",
         help=(
-            "Sample rate for --source deterministic "
+            "Sample rate for --source deterministic and "
+            "--source deterministic-white-noise "
             f"(default: {DEFAULT_DETERMINISTIC_RATE:g}). "
             "--source deterministic-noisy always uses 200 Hz."
         ),
@@ -1347,6 +1355,16 @@ def make_source(args: argparse.Namespace) -> tuple[SignalSource, str]:
                 pending_samples=cast(int, args.pending_samples),
             ),
             f"Deterministic noisy source @ {DEFAULT_NOISY_DETERMINISTIC_RATE:g} Hz",
+        )
+    if args.source == "deterministic-white-noise":
+        return (
+            DeterministicWhiteNoiseSignalSource(
+                channel_name=axis,
+                unit=imu_axis_unit(axis),
+                sample_rate_hz=cast(float, args.deterministic_rate),
+                pending_samples=cast(int, args.pending_samples),
+            ),
+            f"Deterministic white noise source @ {args.deterministic_rate:g} Hz",
         )
 
     port = cast(str | None, args.port) or autodetect_port()

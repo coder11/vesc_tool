@@ -417,7 +417,15 @@ class NoisyDeterministicSignalSource(DeterministicSignalSource):
         return deterministic_noisy_signal_value(sample_index, self._sample_rate_hz)
 
 
+class DeterministicWhiteNoiseSignalSource(DeterministicSignalSource):
+    """Repeatable synthetic signal source containing only pseudo-white noise."""
+
+    def _value_for_sample(self, sample_index: int) -> float:
+        return deterministic_white_noise(sample_index)
+
+
 __all__ = [
+    "DeterministicWhiteNoiseSignalSource",
     "DeterministicSignalSource",
     "FloatArray",
     "NoisyDeterministicSignalSource",

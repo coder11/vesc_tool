@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from vesc_py.live_signal import (
+    DeterministicWhiteNoiseSignalSource,
     DeterministicSignalSource,
     NoisyDeterministicSignalSource,
     PendingSignalBuffer,
@@ -199,3 +200,24 @@ def test_noisy_deterministic_source_uses_noisy_signal_function() -> None:
         assert value == pytest.approx(
             deterministic_noisy_signal_value(sample_index, sample_rate_hz)
         )
+
+
+def test_deterministic_white_noise_source_uses_white_noise_function() -> None:
+    sample_rate_hz = 200.0
+    source = DeterministicWhiteNoiseSignalSource(
+        channel_name="acc_z",
+        unit="g",
+        sample_rate_hz=sample_rate_hz,
+        pending_samples=64,
+    )
+
+    source.start()
+    time.sleep(0.03)
+    source.stop()
+    timestamps, values, _dropped = source.drain()
+
+    assert timestamps.size == values.size
+    assert timestamps.size >= 1
+    for timestamp, value in zip(timestamps, values):
+        sample_index = round(float(timestamp) * sample_rate_hz)
+        assert value == pytest.approx(deterministic_white_noise(sample_index))

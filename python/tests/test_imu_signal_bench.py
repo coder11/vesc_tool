@@ -309,3 +309,24 @@ def test_noisy_deterministic_source_uses_fixed_200_hz_rate() -> None:
         source_label
         == f"Deterministic noisy source @ {DEFAULT_NOISY_DETERMINISTIC_RATE:g} Hz"
     )
+
+
+def test_deterministic_white_noise_source_uses_configured_rate() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--source",
+            "deterministic-white-noise",
+            "--axis",
+            "gyro_z",
+            "--deterministic-rate",
+            "321",
+        ]
+    )
+
+    validate_args(parser, args)
+    source, source_label = make_source(args)
+
+    assert source.channel_name == "gyro_z"
+    assert source.unit == "deg/s"
+    assert source_label == "Deterministic white noise source @ 321 Hz"
