@@ -265,6 +265,30 @@ def deterministic_signal_value(sample_index: int, sample_rate_hz: float) -> floa
     return base + ripple + deterministic_noise
 
 
+def deterministic_white_noise(sample_index: int) -> float:
+    """Return a repeatable uniform white-noise sample in the range [-1, 1)."""
+    mask = (1 << 64) - 1
+    state = (sample_index + 0x9E3779B97F4A7C15) & mask
+    state = ((state ^ (state >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    state = ((state ^ (state >> 27)) * 0x94D049BB133111EB) & mask
+    state ^= state >> 31
+    unit = (state >> 11) * (1.0 / (1 << 53))
+    return unit * 2.0 - 1.0
+
+
+def deterministic_noisy_signal_value(
+    sample_index: int,
+    sample_rate_hz: float,
+) -> float:
+    """Return a repeatable mixed signal with pseudo-white noise."""
+    t = sample_index / sample_rate_hz
+    base = math.sin(2.0 * math.pi * 2.0 * t)
+    mid_tone = 0.35 * math.sin(2.0 * math.pi * 12.0 * t + 0.2)
+    high_tone = 0.2 * math.sin(2.0 * math.pi * 43.0 * t + 0.7)
+    white_noise = 0.18 * deterministic_white_noise(sample_index)
+    return base + mid_tone + high_tone + white_noise
+
+
 class DeterministicSignalSource:
     """Repeatable synthetic signal source implementing the SignalSource protocol."""
 
@@ -344,6 +368,9 @@ class DeterministicSignalSource:
                 done=self._done.is_set(),
             )
 
+    def _value_for_sample(self, sample_index: int) -> float:
+        return deterministic_signal_value(sample_index, self._sample_rate_hz)
+
     def _run(self) -> None:
         self._start_ns = time.perf_counter_ns()
         next_sample_ns = self._start_ns
@@ -368,10 +395,7 @@ class DeterministicSignalSource:
                 )
                 timestamps = indexes.astype(np.float64) / self._sample_rate_hz
                 values = np.array(
-                    [
-                        deterministic_signal_value(int(index), self._sample_rate_hz)
-                        for index in indexes
-                    ],
+                    [self._value_for_sample(int(index)) for index in indexes],
                     dtype=np.float64,
                 )
                 self._samples.append_many(timestamps, values)
@@ -386,14 +410,32 @@ class DeterministicSignalSource:
             self._done.set()
 
 
+class NoisyDeterministicSignalSource(DeterministicSignalSource):
+    """Repeatable synthetic signal source with pseudo-white noise."""
+
+    def _value_for_sample(self, sample_index: int) -> float:
+        return deterministic_noisy_signal_value(sample_index, self._sample_rate_hz)
+
+
+class DeterministicWhiteNoiseSignalSource(DeterministicSignalSource):
+    """Repeatable synthetic signal source containing only pseudo-white noise."""
+
+    def _value_for_sample(self, sample_index: int) -> float:
+        return deterministic_white_noise(sample_index)
+
+
 __all__ = [
+    "DeterministicWhiteNoiseSignalSource",
     "DeterministicSignalSource",
     "FloatArray",
+    "NoisyDeterministicSignalSource",
     "PendingSignalBuffer",
     "SignalRingHistory",
     "SignalSource",
     "SignalSourceSnapshot",
+    "deterministic_noisy_signal_value",
     "deterministic_signal_value",
+    "deterministic_white_noise",
     "residual",
     "trailing_sma",
 ]

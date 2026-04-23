@@ -4,10 +4,14 @@ import numpy as np
 import pytest
 
 from vesc_py.live_signal import (
+    DeterministicWhiteNoiseSignalSource,
     DeterministicSignalSource,
+    NoisyDeterministicSignalSource,
     PendingSignalBuffer,
     SignalRingHistory,
+    deterministic_noisy_signal_value,
     deterministic_signal_value,
+    deterministic_white_noise,
     residual,
     trailing_sma,
 )
@@ -142,3 +146,78 @@ def test_deterministic_source_produces_repeatable_interface_samples() -> None:
         assert value == pytest.approx(
             deterministic_signal_value(sample_index, sample_rate_hz)
         )
+
+
+def test_deterministic_white_noise_is_repeatable_and_bounded() -> None:
+    samples = np.array([deterministic_white_noise(index) for index in range(1024)])
+    repeated = np.array([deterministic_white_noise(index) for index in range(1024)])
+
+    np.testing.assert_allclose(samples, repeated)
+    assert np.all(samples >= -1.0)
+    assert np.all(samples < 1.0)
+    assert float(np.std(samples)) > 0.5
+
+
+def test_deterministic_noisy_signal_is_repeatable_at_fixed_rate() -> None:
+    sample_rate_hz = 200.0
+    values = np.array(
+        [
+            deterministic_noisy_signal_value(index, sample_rate_hz)
+            for index in range(400)
+        ],
+        dtype=np.float64,
+    )
+    repeated = np.array(
+        [
+            deterministic_noisy_signal_value(index, sample_rate_hz)
+            for index in range(400)
+        ],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(values, repeated)
+    assert float(np.std(values)) > 0.6
+
+
+def test_noisy_deterministic_source_uses_noisy_signal_function() -> None:
+    sample_rate_hz = 200.0
+    source = NoisyDeterministicSignalSource(
+        channel_name="acc_z",
+        unit="g",
+        sample_rate_hz=sample_rate_hz,
+        pending_samples=64,
+    )
+
+    source.start()
+    time.sleep(0.03)
+    source.stop()
+    timestamps, values, _dropped = source.drain()
+
+    assert timestamps.size == values.size
+    assert timestamps.size >= 1
+    for timestamp, value in zip(timestamps, values):
+        sample_index = round(float(timestamp) * sample_rate_hz)
+        assert value == pytest.approx(
+            deterministic_noisy_signal_value(sample_index, sample_rate_hz)
+        )
+
+
+def test_deterministic_white_noise_source_uses_white_noise_function() -> None:
+    sample_rate_hz = 200.0
+    source = DeterministicWhiteNoiseSignalSource(
+        channel_name="acc_z",
+        unit="g",
+        sample_rate_hz=sample_rate_hz,
+        pending_samples=64,
+    )
+
+    source.start()
+    time.sleep(0.03)
+    source.stop()
+    timestamps, values, _dropped = source.drain()
+
+    assert timestamps.size == values.size
+    assert timestamps.size >= 1
+    for timestamp, value in zip(timestamps, values):
+        sample_index = round(float(timestamp) * sample_rate_hz)
+        assert value == pytest.approx(deterministic_white_noise(sample_index))

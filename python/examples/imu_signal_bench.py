@@ -3,6 +3,7 @@
 
 Examples:
     python examples/imu_signal_bench.py --source deterministic --axis acc_z --filter sma
+    python examples/imu_signal_bench.py --source deterministic-white-noise --axis acc_z
     python examples/imu_signal_bench.py --source vesc --axis acc_z --pipeline-depth 4
 """
 
@@ -17,7 +18,7 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -33,7 +34,9 @@ from vesc_py.fast_imu_source import (
     parse_imu_axis,
 )
 from vesc_py.live_signal import (
+    DeterministicWhiteNoiseSignalSource,
     DeterministicSignalSource,
+    NoisyDeterministicSignalSource,
     SignalRingHistory,
     SignalSource,
     residual,
@@ -48,6 +51,7 @@ DEFAULT_MAX_POINTS = 1200
 DEFAULT_PLOT_RATE = 30.0
 DEFAULT_PENDING_SAMPLES = 20000
 DEFAULT_DETERMINISTIC_RATE = 500.0
+DEFAULT_NOISY_DETERMINISTIC_RATE = 200.0
 DEFAULT_BIQUAD_NORMALIZED_CUTOFF = 0.0159
 DEFAULT_BIQUAD_CUTOFF_HZ = (
     DEFAULT_BIQUAD_NORMALIZED_CUTOFF * DEFAULT_DETERMINISTIC_RATE
@@ -55,6 +59,10 @@ DEFAULT_BIQUAD_CUTOFF_HZ = (
 DEFAULT_FILTER_CUTOFF_HZ = DEFAULT_BIQUAD_CUTOFF_HZ
 DEFAULT_BIQUAD_SHAPE = 0.707
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+
+SpectrumMode = Literal["fft", "psd"]
+SPECTRUM_MODES: tuple[SpectrumMode, SpectrumMode] = ("fft", "psd")
+DEFAULT_SPECTRUM_MODE: SpectrumMode = "psd"
 
 FILTER_LABELS = {
     "biquad": "Biquad IIR LPF",
@@ -416,11 +424,10 @@ def signal_stats(values: npt.NDArray[np.float64]) -> SignalStats | None:
     )
 
 
-def signal_psd(
+def _signal_frequency_window(
     timestamps: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
-) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None:
-    """Return one-sided PSD bins for a scalar signal window."""
+) -> tuple[npt.NDArray[np.float64], float] | None:
     sample_count = int(min(timestamps.size, values.size))
     if sample_count < 2:
         return None
@@ -436,6 +443,48 @@ def signal_psd(
     if not np.isfinite(sample_period) or sample_period <= 0.0:
         return None
 
+    return window_values, sample_period
+
+
+def signal_fft(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None:
+    """Return one-sided FFT magnitude bins for a scalar signal window."""
+    frequency_window = _signal_frequency_window(timestamps, values)
+    if frequency_window is None:
+        return None
+
+    window_values, sample_period = frequency_window
+    sample_count = int(window_values.size)
+    centered = window_values.astype(np.float64, copy=False) - float(
+        np.mean(window_values)
+    )
+    magnitudes = np.abs(np.fft.rfft(centered)) / sample_count
+    if magnitudes.size > 1:
+        if sample_count % 2 == 0:
+            magnitudes[1:-1] *= 2.0
+        else:
+            magnitudes[1:] *= 2.0
+
+    frequencies = cast(
+        "npt.NDArray[np.float64]",
+        np.fft.rfftfreq(sample_count, d=sample_period),
+    )
+    return frequencies, magnitudes
+
+
+def signal_psd(
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None:
+    """Return one-sided PSD bins for a scalar signal window."""
+    frequency_window = _signal_frequency_window(timestamps, values)
+    if frequency_window is None:
+        return None
+
+    window_values, sample_period = frequency_window
+    sample_count = int(window_values.size)
     sample_rate_hz = 1.0 / sample_period
     window = np.hanning(sample_count)
     if not np.any(window):
@@ -461,6 +510,17 @@ def signal_psd(
         np.fft.rfftfreq(sample_count, d=sample_period),
     )
     return frequencies, psd
+
+
+def signal_frequency_analysis(
+    mode: SpectrumMode,
+    timestamps: npt.NDArray[np.float64],
+    values: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None:
+    """Return scalar frequency analysis bins for the selected mode."""
+    if mode == "fft":
+        return signal_fft(timestamps, values)
+    return signal_psd(timestamps, values)
 
 
 def format_stats(stats: SignalStats | None, unit: str) -> str:
@@ -587,6 +647,20 @@ def run_signal_bench(
         mode_buttons[mode_name] = button
         controls.addWidget(button)
 
+    spectrum_label = QtWidgets.QLabel("Spectrum")
+    controls.addWidget(spectrum_label)
+    spectrum_mode_group = QtWidgets.QButtonGroup(window)
+    spectrum_mode_group.setExclusive(True)
+    spectrum_mode_buttons: dict[SpectrumMode, Any] = {}
+    for spectrum_mode in SPECTRUM_MODES:
+        button = QtWidgets.QPushButton(spectrum_mode.upper())
+        button.setCheckable(True)
+        if spectrum_mode == DEFAULT_SPECTRUM_MODE:
+            button.setChecked(True)
+        spectrum_mode_group.addButton(button)
+        spectrum_mode_buttons[spectrum_mode] = button
+        controls.addWidget(button)
+
     clear_button = QtWidgets.QPushButton("Clear")
     controls.addWidget(clear_button)
     controls.addStretch(1)
@@ -604,7 +678,7 @@ def run_signal_bench(
     root.addLayout(plot_row, stretch=1)
 
     plot_widget = pg.PlotWidget(title="Time Series")
-    spectrum_widget = pg.PlotWidget(title="PSD")
+    spectrum_widget = pg.PlotWidget(title=DEFAULT_SPECTRUM_MODE.upper())
     for widget in (plot_widget, spectrum_widget):
         widget.setMinimumSize(0, 0)
         widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
@@ -691,31 +765,31 @@ def run_signal_bench(
         if method is not None:
             method(*args)
 
-    raw_psd_line = pg.PlotCurveItem(
+    raw_spectrum_line = pg.PlotCurveItem(
         empty,
         empty,
         pen=pg.mkPen(selected_theme.line_colors[0], width=1.3),
-        name="Raw PSD",
+        name="Raw",
         connect="all",
         skipFiniteCheck=True,
     )
-    filtered_psd_line = pg.PlotCurveItem(
+    filtered_spectrum_line = pg.PlotCurveItem(
         empty,
         empty,
         pen=pg.mkPen(selected_theme.line_colors[1], width=1.6),
-        name="Filtered PSD",
+        name="Filtered",
         connect="all",
         skipFiniteCheck=True,
     )
-    residual_psd_line = pg.PlotCurveItem(
+    residual_spectrum_line = pg.PlotCurveItem(
         empty,
         empty,
         pen=pg.mkPen(selected_theme.line_colors[2], width=1.4),
-        name="Residual PSD",
+        name="Residual",
         connect="all",
         skipFiniteCheck=True,
     )
-    for line in (raw_psd_line, filtered_psd_line, residual_psd_line):
+    for line in (raw_spectrum_line, filtered_spectrum_line, residual_spectrum_line):
         line.setSkipFiniteCheck(True)
         spectrum_plot.addItem(line)
     spectrum_legend = spectrum_plot.addLegend(offset=(10, 10))
@@ -739,11 +813,36 @@ def run_signal_bench(
                 return mode_name
         return "both"
 
+    def selected_spectrum_mode() -> SpectrumMode:
+        for mode_name, button in spectrum_mode_buttons.items():
+            if button.isChecked():
+                return mode_name
+        return DEFAULT_SPECTRUM_MODE
+
     def selected_filter() -> str:
         filter_name = filter_combo.currentData()
         if isinstance(filter_name, str) and filter_name in FILTER_LABELS:
             return filter_name
         return DEFAULT_FILTER
+
+    def update_spectrum_labels(mode_name: SpectrumMode) -> None:
+        if mode_name == "fft":
+            spectrum_plot.setTitle("FFT")
+            spectrum_plot.setLabel("left", "FFT magnitude", units=source.unit)
+        else:
+            spectrum_plot.setTitle("PSD")
+            spectrum_plot.setLabel("left", "PSD", units=f"{source.unit}^2/Hz")
+
+    def clear_line_data(line: Any) -> None:
+        line.setData(x=empty, y=empty, connect="all", skipFiniteCheck=True)
+
+    def clear_spectrum_lines() -> None:
+        for line in (
+            raw_spectrum_line,
+            filtered_spectrum_line,
+            residual_spectrum_line,
+        ):
+            clear_line_data(line)
 
     def update_filter_controls() -> None:
         filter_name = selected_filter()
@@ -773,42 +872,43 @@ def run_signal_bench(
             raw_line,
             filtered_line,
             residual_line,
-            raw_psd_line,
-            filtered_psd_line,
-            residual_psd_line,
+            raw_spectrum_line,
+            filtered_spectrum_line,
+            residual_spectrum_line,
         ):
-            line.setData(x=empty, y=empty, connect="all", skipFiniteCheck=True)
+            clear_line_data(line)
 
     def set_visible_lines(mode_name: str) -> None:
         raw_line.setVisible(mode_name in ("raw", "both"))
         filtered_line.setVisible(mode_name in ("filtered", "both"))
         residual_line.setVisible(mode_name == "residual")
-        raw_psd_line.setVisible(mode_name in ("raw", "both"))
-        filtered_psd_line.setVisible(mode_name in ("filtered", "both"))
-        residual_psd_line.setVisible(mode_name == "residual")
+        raw_spectrum_line.setVisible(mode_name in ("raw", "both"))
+        filtered_spectrum_line.setVisible(mode_name in ("filtered", "both"))
+        residual_spectrum_line.setVisible(mode_name == "residual")
         zero_line.setVisible(mode_name == "residual")
         legend.setVisible(mode_name == "both")
         spectrum_legend.setVisible(mode_name == "both")
 
-    def set_psd_data(
+    def set_spectrum_data(
         line: Any,
+        spectrum_mode: SpectrumMode,
         timestamps: npt.NDArray[np.float64],
         values: npt.NDArray[np.float64],
     ) -> float | None:
-        psd_data = signal_psd(timestamps, values)
-        if psd_data is None:
-            line.setData(x=empty, y=empty, connect="all", skipFiniteCheck=True)
+        spectrum_data = signal_frequency_analysis(spectrum_mode, timestamps, values)
+        if spectrum_data is None:
+            clear_line_data(line)
             return None
 
-        frequencies, psd_values = psd_data
+        frequencies, spectrum_values = spectrum_data
         indexes = decimate_indexes(int(frequencies.size), max_points)
         if indexes is not None:
             frequencies = frequencies[indexes]
-            psd_values = psd_values[indexes]
+            spectrum_values = spectrum_values[indexes]
 
         line.setData(
             x=frequencies,
-            y=psd_values,
+            y=spectrum_values,
             connect="all",
             skipFiniteCheck=True,
         )
@@ -928,17 +1028,44 @@ def run_signal_bench(
             connect="all",
             skipFiniteCheck=True,
         )
-        raw_nyquist = set_psd_data(raw_psd_line, timestamps_values, raw_values)
-        filtered_nyquist = set_psd_data(
-            filtered_psd_line,
-            timestamps_values,
-            filtered_values,
+        display_mode = selected_mode()
+        spectrum_mode = selected_spectrum_mode()
+        raw_nyquist = (
+            set_spectrum_data(
+                raw_spectrum_line,
+                spectrum_mode,
+                timestamps_values,
+                raw_values,
+            )
+            if display_mode in ("raw", "both")
+            else None
         )
-        residual_nyquist = set_psd_data(
-            residual_psd_line,
-            timestamps_values,
-            residual_values,
+        filtered_nyquist = (
+            set_spectrum_data(
+                filtered_spectrum_line,
+                spectrum_mode,
+                timestamps_values,
+                filtered_values,
+            )
+            if display_mode in ("filtered", "both")
+            else None
         )
+        residual_nyquist = (
+            set_spectrum_data(
+                residual_spectrum_line,
+                spectrum_mode,
+                timestamps_values,
+                residual_values,
+            )
+            if display_mode == "residual"
+            else None
+        )
+        if display_mode not in ("raw", "both"):
+            clear_line_data(raw_spectrum_line)
+        if display_mode not in ("filtered", "both"):
+            clear_line_data(filtered_spectrum_line)
+        if display_mode != "residual":
+            clear_line_data(residual_spectrum_line)
         nyquist_values = (
             value
             for value in (raw_nyquist, filtered_nyquist, residual_nyquist)
@@ -950,7 +1077,7 @@ def run_signal_bench(
         )
         if nyquist_hz is not None and nyquist_hz > 0.0:
             spectrum_plot.setXRange(0.0, nyquist_hz, padding=0.0)
-        set_visible_lines(selected_mode())
+        set_visible_lines(display_mode)
         plot.setXRange(0.0, float(history), padding=0.0)
 
     def refresh_status() -> None:
@@ -971,6 +1098,7 @@ def run_signal_bench(
             f"filter: {latest_filter_status} | samples: {snapshot.samples} | "
             f"source avg: {snapshot.average_rate_hz:.1f} Hz | "
             f"history: {format_rate(history_hz)} | plot: {format_rate(plot_hz)} | "
+            f"spectrum: {selected_spectrum_mode().upper()} | "
             f"dropped: {snapshot.dropped + dropped_pending} | errors: {snapshot.errors}"
             f"{error_text}"
         )
@@ -987,15 +1115,22 @@ def run_signal_bench(
         plot_timer.stop()
         status_timer.stop()
 
+    def apply_spectrum_mode() -> None:
+        update_spectrum_labels(selected_spectrum_mode())
+        clear_spectrum_lines()
+        refresh_plot()
+        refresh_status()
+
     clear_button.clicked.connect(clear_history)
     filter_combo.currentIndexChanged.connect(lambda _index=0: update_filter_controls())
     for button in mode_buttons.values():
-        button.clicked.connect(
-            lambda _checked=False: set_visible_lines(selected_mode())
-        )
+        button.clicked.connect(lambda _checked=False: refresh_plot())
+    for button in spectrum_mode_buttons.values():
+        button.clicked.connect(lambda _checked=False: apply_spectrum_mode())
     window.destroyed.connect(stop_updates)
 
     update_filter_controls()
+    update_spectrum_labels(DEFAULT_SPECTRUM_MODE)
     set_visible_lines("both")
     refresh_plot()
     refresh_status()
@@ -1020,7 +1155,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=("vesc", "deterministic"),
+        choices=(
+            "vesc",
+            "deterministic",
+            "deterministic-noisy",
+            "deterministic-white-noise",
+        ),
         default="vesc",
         help="Signal source to use (default: vesc).",
     )
@@ -1156,8 +1296,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DETERMINISTIC_RATE,
         metavar="HZ",
         help=(
-            "Sample rate for --source deterministic "
-            f"(default: {DEFAULT_DETERMINISTIC_RATE:g})."
+            "Sample rate for --source deterministic and "
+            "--source deterministic-white-noise "
+            f"(default: {DEFAULT_DETERMINISTIC_RATE:g}). "
+            "--source deterministic-noisy always uses 200 Hz."
         ),
     )
     return parser
@@ -1203,6 +1345,26 @@ def make_source(args: argparse.Namespace) -> tuple[SignalSource, str]:
                 pending_samples=cast(int, args.pending_samples),
             ),
             f"Deterministic source @ {args.deterministic_rate:g} Hz",
+        )
+    if args.source == "deterministic-noisy":
+        return (
+            NoisyDeterministicSignalSource(
+                channel_name=axis,
+                unit=imu_axis_unit(axis),
+                sample_rate_hz=DEFAULT_NOISY_DETERMINISTIC_RATE,
+                pending_samples=cast(int, args.pending_samples),
+            ),
+            f"Deterministic noisy source @ {DEFAULT_NOISY_DETERMINISTIC_RATE:g} Hz",
+        )
+    if args.source == "deterministic-white-noise":
+        return (
+            DeterministicWhiteNoiseSignalSource(
+                channel_name=axis,
+                unit=imu_axis_unit(axis),
+                sample_rate_hz=cast(float, args.deterministic_rate),
+                pending_samples=cast(int, args.pending_samples),
+            ),
+            f"Deterministic white noise source @ {args.deterministic_rate:g} Hz",
         )
 
     port = cast(str | None, args.port) or autodetect_port()
