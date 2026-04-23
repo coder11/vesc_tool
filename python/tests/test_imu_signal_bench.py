@@ -1,21 +1,28 @@
 import os
+import sys
 
 import numpy as np
 import pytest
 
 from examples.imu_signal_bench import (
     Biquad,
+    DEFAULT_NOISY_DETERMINISTIC_RATE,
     biquad_config_lowpass,
     biquad_lowpass,
     biquad_lowpass_hz,
+    build_parser,
     fir_lowpass_coefficients,
     fir_lowpass_hz,
     format_stats,
+    make_source,
     normalized_biquad_cutoff,
     one_pole_lowpass_hz,
     prefer_qt_xcb_platform,
+    signal_fft,
+    signal_frequency_analysis,
     signal_psd,
     signal_stats,
+    validate_args,
 )
 
 
@@ -202,6 +209,20 @@ def test_signal_psd_returns_frequency_bins_and_positive_power() -> None:
     assert np.all(power >= 0.0)
 
 
+def test_signal_fft_returns_frequency_bins_and_peak_magnitude() -> None:
+    sample_rate_hz = 100.0
+    timestamps = np.arange(100, dtype=np.float64) / sample_rate_hz
+    values = np.sin(2.0 * np.pi * 10.0 * timestamps)
+
+    spectrum = signal_fft(timestamps, values)
+
+    assert spectrum is not None
+    frequencies, magnitudes = spectrum
+    peak_index = int(np.argmax(magnitudes[1:]) + 1)
+    assert frequencies[peak_index] == pytest.approx(10.0)
+    assert magnitudes[peak_index] == pytest.approx(1.0, rel=0.05)
+
+
 def test_signal_psd_handles_missing_timing() -> None:
     psd = signal_psd(
         np.array([1.0, 1.0], dtype=np.float64),
@@ -209,6 +230,37 @@ def test_signal_psd_handles_missing_timing() -> None:
     )
 
     assert psd is None
+
+
+def test_signal_frequency_analysis_only_dispatches_selected_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    timestamps = np.array([0.0, 1.0], dtype=np.float64)
+    values = np.array([0.0, 1.0], dtype=np.float64)
+
+    def fake_fft(
+        _timestamps: np.ndarray,
+        _values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        calls.append("fft")
+        return None
+
+    def fake_psd(
+        _timestamps: np.ndarray,
+        _values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        calls.append("psd")
+        return None
+
+    module = sys.modules[signal_frequency_analysis.__module__]
+    monkeypatch.setattr(module, "signal_fft", fake_fft)
+    monkeypatch.setattr(module, "signal_psd", fake_psd)
+
+    signal_frequency_analysis("fft", timestamps, values)
+    signal_frequency_analysis("psd", timestamps, values)
+
+    assert calls == ["fft", "psd"]
 
 
 def test_prefer_qt_xcb_platform_replaces_wayland_fallback(
@@ -233,3 +285,27 @@ def test_prefer_qt_xcb_platform_preserves_explicit_platform(
     prefer_qt_xcb_platform()
 
     assert os.environ["QT_QPA_PLATFORM"] == "wayland"
+
+
+def test_noisy_deterministic_source_uses_fixed_200_hz_rate() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--source",
+            "deterministic-noisy",
+            "--axis",
+            "acc_z",
+            "--deterministic-rate",
+            "123",
+        ]
+    )
+
+    validate_args(parser, args)
+    source, source_label = make_source(args)
+
+    assert source.channel_name == "acc_z"
+    assert source.unit == "g"
+    assert (
+        source_label
+        == f"Deterministic noisy source @ {DEFAULT_NOISY_DETERMINISTIC_RATE:g} Hz"
+    )
